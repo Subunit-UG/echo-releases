@@ -377,8 +377,21 @@ jobs:
           & "C:\Program Files\LLVM\bin\clang-cl.exe" --version
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
           "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-          choco install cmake ninja --no-progress -y --installargs 'ADD_CMAKE_TO_PATH=System'
-          "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          # CMake 4.4.4 straight from Kitware, pinned by hash. The Chocolatey feed
+          # refuses runner IPs at times ("Unable to find package 'cmake'", yet
+          # "installed 1/1"): the build then ran with the image's CMake and libopus
+          # failed on ARM64 (armcpu.c: undeclared '__emit'), v0.6.38 and v0.6.43.
+          $cmakeZip = "$env:RUNNER_TEMP\cmake-arm64.zip"
+          Invoke-WebRequest -Uri "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-arm64.zip" -OutFile $cmakeZip
+          $sha = (Get-FileHash -Algorithm SHA256 $cmakeZip).Hash.ToLower()
+          if ($sha -ne "ed673bbc4eb7c1e59b0407fd52f1680fc0ae3229a46b9b7b3ea9133764f07f67") { throw "CMake download hash mismatch: $sha" }
+          Expand-Archive -Path $cmakeZip -DestinationPath "$env:RUNNER_TEMP\cmake" -Force
+          $cmakeBin = "$env:RUNNER_TEMP\cmake\cmake-4.4.4-windows-arm64\bin"
+          & "$cmakeBin\cmake.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "CMake 4.4.4 not runnable" }
+          "$cmakeBin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          choco install ninja --no-progress -y
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { throw "ninja missing" }
           "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
           "CC=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append
           "CXX=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append
