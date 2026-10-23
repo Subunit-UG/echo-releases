@@ -29,29 +29,14 @@
 #   sichtbare Notausgang).
 #
 # ──────────────────────────────────────────────────────────────────────────────
-# SICHERHEIT / LEAK-BUDGET (bewusst gewählt, nicht vergessen)
+# VERTRAULICHE AUSGABE
 #
-# Was hier öffentlich wird, weil ein Compile-Gate es drucken muss:
-#   • Datei, ZEILE und Spalte jeder Diagnose (`src/foo.rs:80:30: error[E0308]: …`).
-#   • Testnamen, Testpfade und Modulstruktur aus `cargo test` (interne Architektur).
-#   • Panic-/Assertion-Texte eines ROTEN Tests inkl. der verglichenen Literale.
-#   • Der Branch-Name — er steht als dispatch-Input in der Run-UI dieses Repos.
-#     → REGEL: keine Kunden-/Projektnamen mehr in echo-tauri-Branch-Namen.
+# npm/cargo-Diagnostik einschließlich Tests, Build-Skripten und Code-Frames
+# wird vollständig in einem privaten temporären Verzeichnis abgefangen und
+# anschließend gelöscht. Öffentlich erscheinen nur fester Status und Exit-Code.
+# Der Helfer stammt aus dem öffentlichen CI-Commit, niemals aus echo-tauri.
+# Branch-Namen bleiben als dispatch-Input öffentlich: keine Kundennamen verwenden.
 #
-# Was hier AKTIV entschärft ist:
-#   • KEINE ZITIERTEN QUELLZEILEN: alle cargo-Aufrufe laufen mit
-#     `--message-format short`. Default-rustc druckt bei jedem Fehler den
-#     kompletten Quelltext der betroffenen Zeile (plus help:-Vorschläge) —
-#     in einem PUBLIC Log ist das veröffentlichter Quellcode aus einem privaten
-#     Repo. Lokal gegengeprüft mit einem provozierten E0308:
-#       default : "80 | fn leak_probe2() -> String { leak_probe() }"  ← Quelltext
-#       short   : "src/digits.rs:80:30: error[E0308]: mismatched types: …"
-#     Exit-Code bleibt in beiden Fällen 101 — das Gate verliert nichts, der
-#     Entwickler bekommt Datei:Zeile:Spalte und rendert das Detail lokal.
-#     `tsc` braucht das nicht: ohne TTY (also in CI) druckt es ohnehin nur
-#     "src/a.ts(1,7): error TS2322: …" ohne Code-Frame (lokal verifiziert).
-#     RESTRISIKO: bricht erst `vite build` (also NACH grünem tsc), kann
-#     rollup einen Code-Frame drucken. Selten, aber nicht null.
 #   • MASKIERUNG: `ci/log-mask-words.txt` aus dem PRIVATEN Repo wird nach dem
 #     Clone eingelesen und jedes Wort per `::add-mask::` registriert, BEVOR
 #     irgendein Build-/Test-Schritt läuft. Damit erscheinen Kundennamen, die in
@@ -107,7 +92,7 @@ concurrency:
 
 env:
   SOURCE_REPO: subunit-ai/echo-tauri
-  # Bewusst NICHT gesetzt: RUST_BACKTRACE (siehe Leak-Budget oben).
+  # Bewusst NICHT gesetzt: RUST_BACKTRACE; Diagnostik bleibt vertraulich.
 
 jobs:
   # ── Linux-Gate: Frontend-Build + cargo check + cargo test ──────────────────
@@ -145,7 +130,7 @@ jobs:
           printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/echo_ci"
           chmod 600 "$HOME/.ssh/echo_ci"
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-          git clone --depth 1 --branch "$SRC_REF" "git@github.com:$SOURCE_REPO.git" src
+          git clone --depth 1 --branch "$SRC_REF" "git@github.com:$SOURCE_REPO.git" src >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           git -C src config --unset-all core.sshCommand 2>/dev/null || true
           rm -f "$HOME/.ssh/echo_ci"
           echo "ausgecheckt: $SRC_REF → $(git -C src rev-parse --short HEAD)"
@@ -163,6 +148,24 @@ jobs:
       # Dasselbe gilt für eine vorhandene, aber komplett auskommentierte Liste.
       # Hinweis: `::add-mask::` ersetzt Treffer im Log durch `***`; die Registrierung
       # selbst wird vom Runner konsumiert. Ausgegeben wird hier nur die ANZAHL.
+      - name: Reserve trusted CI paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          for path in _release-ci _release-tauri; do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              echo "::error::reserved CI path already exists"; exit 1
+            fi
+          done
+
+      - name: Checkout trusted public CI controls
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _release-ci
+          persist-credentials: false
+
       - name: Log-Maskierung scharf schalten (fail-closed)
         shell: bash
         run: |
@@ -170,8 +173,8 @@ jobs:
           f=src/ci/log-mask-words.txt
           if [ ! -f "$f" ]; then
             echo "::error::Maskierungsliste fehlt ($f). Dieser Job schreibt in ein"
-            echo "::error::OEFFENTLICHES Log; ohne die Liste stuenden Kundennamen aus"
-            echo "::error::roten Test-Assertions im Klartext darin. Abbruch."
+            echo "::error::OEFFENTLICHES Log; die Liste bleibt als zusaetzlicher Schutz"
+            echo "::error::neben der abgeschirmten Build-/Test-Ausgabe Pflicht. Abbruch."
             echo "::error::Fix: aktuellen main in den geprueften Branch mergen."
             exit 1
           fi
@@ -217,25 +220,25 @@ jobs:
 
       - name: Frontend bauen (tsc + vite)
         working-directory: src
+        shell: bash
         run: |
-          npm ci
-          npm run build
+          bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" npm ci
+          bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" npm run build
 
-      # `--message-format short`: siehe Leak-Budget oben. Kurzfassung — rustc
-      # druckt sonst den kompletten Quelltext jeder fehlerhaften Zeile in dieses
-      # ÖFFENTLICHE Log. Mit `short` bleibt Datei:Zeile:Spalte + Meldung; der
-      # Exit-Code (101) ist identisch, das Gate verliert also keine Schärfe.
-      # Betrifft nur die Compiler-Diagnostik: die Testausgabe des Harness
-      # ("running N tests" / "test result: …") bleibt unverändert (verifiziert).
+      # Kurzformat bleibt erhalten; die gesamte Diagnostik wird abgeschirmt.
       - name: cargo check + test (BLOCKING)
         working-directory: src/src-tauri
+        shell: bash
         run: |
-          cargo check --locked --message-format short
-          cargo test --locked --message-format short
+          bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" cargo check --locked --message-format short
+          bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" cargo test --locked --message-format short
 
       - name: clippy (advisory)
         working-directory: src/src-tauri
-        run: cargo clippy --locked --message-format short -- -D warnings || cargo clippy --locked --message-format short
+        shell: bash
+        run: |
+          bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" cargo clippy --locked --message-format short -- -D warnings || \
+            bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" cargo clippy --locked --message-format short
 
       # Nur Metadaten in die Zusammenfassung — Ref und SHA sind über den
       # dispatch-Input ohnehin öffentlich. Kein Log-Auszug, kein Quellcode.
@@ -289,11 +292,29 @@ jobs:
           printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/echo_ci"
           chmod 600 "$HOME/.ssh/echo_ci"
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-          git clone --depth 1 --branch "$SRC_REF" "git@github.com:$SOURCE_REPO.git" src
+          git clone --depth 1 --branch "$SRC_REF" "git@github.com:$SOURCE_REPO.git" src >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           git -C src config --unset-all core.sshCommand 2>/dev/null || true
           rm -f "$HOME/.ssh/echo_ci"
 
       # Fail-closed, identisch zum Linux-Job (Begründung dort).
+      - name: Reserve trusted CI paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          for path in _release-ci _release-tauri; do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              echo "::error::reserved CI path already exists"; exit 1
+            fi
+          done
+
+      - name: Checkout trusted public CI controls
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _release-ci
+          persist-credentials: false
+
       - name: Log-Maskierung scharf schalten (fail-closed)
         shell: bash
         run: |
@@ -301,8 +322,8 @@ jobs:
           f=src/ci/log-mask-words.txt
           if [ ! -f "$f" ]; then
             echo "::error::Maskierungsliste fehlt ($f). Dieser Job schreibt in ein"
-            echo "::error::OEFFENTLICHES Log; ohne die Liste stuenden Kundennamen aus"
-            echo "::error::roten Test-Assertions im Klartext darin. Abbruch."
+            echo "::error::OEFFENTLICHES Log; die Liste bleibt als zusaetzlicher Schutz"
+            echo "::error::neben der abgeschirmten Build-/Test-Ausgabe Pflicht. Abbruch."
             echo "::error::Fix: aktuellen main in den geprueften Branch mergen."
             exit 1
           fi
@@ -337,10 +358,12 @@ jobs:
       # tauri-build validiert die Config und erwartet ein vorhandenes dist/.
       - name: Frontend bauen
         working-directory: src
+        shell: bash
         run: |
-          npm ci
-          npm run build
+          bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" npm ci
+          bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" npm run build
 
       - name: cargo check (Default-Features → kein whisper.cpp/cmake nötig)
         working-directory: src/src-tauri
-        run: cargo check --locked --message-format short
+        shell: bash
+        run: bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" cargo check --locked --message-format short

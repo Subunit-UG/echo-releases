@@ -145,7 +145,8 @@ jobs:
           chmod 600 ~/.ssh/echo_ci
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o StrictHostKeyChecking=accept-new"
           refs=$(git ls-remote "git@github.com:$SOURCE_REPO.git" \
-            "refs/tags/$REF" "refs/tags/$REF^{}")
+            "refs/tags/$REF" "refs/tags/$REF^{}" 2>/dev/null) \
+            || { echo "::error::private source resolution failed"; exit 1; }
           rm -f ~/.ssh/echo_ci
           direct=$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$REF" '$2 == ref { print $1 }')
           peeled=$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$REF^{}" '$2 == ref { print $1 }')
@@ -314,17 +315,43 @@ jobs:
           chmod 600 ~/.ssh/echo_ci
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o StrictHostKeyChecking=accept-new"
           if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
-            git init .
-            git remote add origin "git@github.com:$SOURCE_REPO.git"
-            git fetch --depth 1 origin "$SOURCE_COMMIT"
-            git checkout --detach FETCH_HEAD
+            git init . >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
+            git remote add origin "git@github.com:$SOURCE_REPO.git" >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
+            git fetch --depth 1 origin "$SOURCE_COMMIT" >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
+            git checkout --detach FETCH_HEAD >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           else
-            git clone --depth 1 --branch "$REF" "git@github.com:subunit-ai/echo-tauri.git" .
+            git clone --depth 1 --branch "$REF" "git@github.com:subunit-ai/echo-tauri.git" . >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           fi
           git config --unset-all core.sshCommand 2>/dev/null || true
           rm -f ~/.ssh/echo_ci
           [ "$(git rev-parse HEAD)" = "$SOURCE_COMMIT" ] \
             || { echo "::error::source tag moved after prepare"; exit 1; }
+
+      - name: Reserve trusted CI paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          for path in _release-ci _release-tauri; do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              echo "::error::reserved CI path already exists"; exit 1
+            fi
+          done
+
+      - name: Checkout trusted public CI controls
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _release-ci
+          persist-credentials: false
+
+      - name: Checkout pinned upstream Tauri action
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: tauri-apps/tauri-action
+          ref: 84b9d35b5fc46c1e45415bdb6144030364f7ebc5
+          path: _release-tauri
+          persist-credentials: false
 
       - name: Install Linux deps
         if: matrix.platform == 'ubuntu-24.04'
@@ -430,7 +457,7 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          node <<'NODE'
+          bash _release-ci/scripts/run-confidential.sh node <<'NODE'
           const fs = require("fs");
           const { execFileSync } = require("child_process");
           const expected = process.env.TAG.slice(1);
@@ -483,7 +510,8 @@ jobs:
           console.log(`version contract verified: ${expected}`);
           NODE
 
-      - run: npm ci
+      - shell: bash
+        run: bash _release-ci/scripts/run-confidential.sh npm ci
 
       - name: macOS signing keychain (stable self-signed cert — keeps TCC grants across updates)
         if: matrix.platform == 'macos-14'
@@ -512,7 +540,7 @@ jobs:
           echo "valid codesigning identities now:"
           security find-identity -v -p codesigning build.keychain
 
-      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+      - uses: ./_release-ci/.github/actions/confidential-tauri
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -561,20 +589,22 @@ jobs:
           chmod 600 ~/.ssh/echo_ci
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o StrictHostKeyChecking=accept-new"
           if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
-            git init _source
-            git -C _source remote add origin "git@github.com:$SOURCE_REPO.git"
-            git -C _source fetch --depth 1 origin "$SOURCE_COMMIT"
-            git -C _source checkout --detach FETCH_HEAD
+            git init _source >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
+            git -C _source remote add origin "git@github.com:$SOURCE_REPO.git" >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
+            git -C _source fetch --depth 1 origin "$SOURCE_COMMIT" >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
+            git -C _source checkout --detach FETCH_HEAD >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           else
-            git clone --depth 1 --branch "$REF" "git@github.com:$SOURCE_REPO.git" _source
+            git clone --depth 1 --branch "$REF" "git@github.com:$SOURCE_REPO.git" _source >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           fi
           rm -f ~/.ssh/echo_ci
           [ "$(git -C _source rev-parse HEAD)" = "$SOURCE_COMMIT" ] \
             || { echo "::error::source tag moved after prepare"; exit 1; }
           expected="${TAG#v}"
+          bash scripts/run-confidential.sh bash -s -- "$expected" <<'VERSION'
+          set -euo pipefail
           actual=$(jq -r '.version // empty' _source/src-tauri/tauri.conf.json)
-          [ "$actual" = "$expected" ] \
-            || { echo "::error::built updater config version=$actual, expected $expected"; exit 1; }
+          [ "$actual" = "$1" ]
+          VERSION
       - id: verify
         name: Cryptographically verify four updater pairs and record IDs + hashes
         env:
@@ -606,7 +636,7 @@ jobs:
             sig_ids+=("$RELEASE_ASSET_LAST_ID")
           done
 
-          python3 scripts/verify-updater-signatures.py \
+          bash scripts/run-confidential.sh python3 scripts/verify-updater-signatures.py \
             --config _source/src-tauri/tauri.conf.json \
             --evidence-dir "$evidence_dir/minisign" \
             --output-json "$evidence_dir/verified.json" \
