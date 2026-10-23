@@ -18,6 +18,7 @@ on:
       - "scripts/verify-platform-windows.ps1"
       - "tests/test_release_workflow.py"
       - "tests/test_confidential_output.py"
+      - "tests/fixtures/confidential-hosted/**"
       - "scripts/run-confidential.sh"
       - ".github/actions/confidential-tauri/**"
       - "README.md"
@@ -40,6 +41,7 @@ on:
       - "scripts/verify-platform-windows.ps1"
       - "tests/test_release_workflow.py"
       - "tests/test_confidential_output.py"
+      - "tests/fixtures/confidential-hosted/**"
       - "scripts/run-confidential.sh"
       - ".github/actions/confidential-tauri/**"
       - "README.md"
@@ -61,3 +63,53 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y minisign
       - run: python -m unittest discover -s tests -v
+
+  confidential-hosted:
+    # Public synthetic data only; no private checkout, credentials, artifacts or release.
+    # Match the release build's actual host OS/architectures without invoking that build.
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-24.04, macos-14, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Checkout public pinned upstream for metadata and pre-build probes
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: tauri-apps/tauri-action
+          ref: 84b9d35b5fc46c1e45415bdb6144030364f7ebc5
+          path: _public-upstream
+          persist-credentials: false
+      - name: Prepare public fixture
+        shell: bash
+        run: node tests/fixtures/confidential-hosted/probe.cjs prepare
+      - name: Actual node24 action succeeds with synthetic output
+        id: public_success
+        uses: ./.github/actions/confidential-tauri
+        env:
+          PUBLIC_FIXTURE_STATUS: '0'
+        with:
+          releaseId: '42'
+          args: '--public-fixture argument with spaces'
+      - name: Actual node24 action retains synthetic failure
+        id: public_failure
+        continue-on-error: true
+        uses: ./.github/actions/confidential-tauri
+        env:
+          PUBLIC_FIXTURE_STATUS: '37'
+        with:
+          releaseId: '42'
+          args: '--public-fixture argument with spaces'
+      - name: Verify runner channels and captured controls using action runtime
+        if: always()
+        shell: bash
+        env:
+          PUBLIC_SUCCESS_OUTCOME: ${{ steps.public_success.outcome }}
+          PUBLIC_FAILURE_OUTCOME: ${{ steps.public_failure.outcome }}
+          PUBLIC_SUCCESS_OUTPUT: ${{ steps.public_success.outputs.releaseId }}
+          PUBLIC_FAILURE_OUTPUT: ${{ steps.public_failure.outputs.releaseId }}
+        run: node tests/fixtures/confidential-hosted/probe.cjs hosted

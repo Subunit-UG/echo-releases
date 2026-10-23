@@ -253,6 +253,34 @@ class ConfidentialWorkflowTests(unittest.TestCase):
         for path in ('tests/test_confidential_output.py', 'scripts/run-confidential.sh', '.github/actions/confidential-tauri/**'):
             self.assertEqual(contract.count('"' + path + '"'), 2)
 
+    def test_hosted_proof_is_public_only_and_covers_every_build_host(self):
+        contract = (WORKFLOWS / 'release-contract.yml').read_text()
+        hosted = contract.split('  confidential-hosted:\n', 1)[1]
+        build_hosts = set(re.findall(r'          - platform: (\S+)', self.texts['build']))
+        proof_hosts = set(re.search(r'platform: \[([^]]+)\]', hosted)[1].split(', '))
+        self.assertEqual(proof_hosts, build_hosts)
+        self.assertEqual(hosted.count('uses: ./.github/actions/confidential-tauri'), 2)
+        self.assertIn('steps.public_failure.outcome', hosted)
+        self.assertIn('steps.public_failure.outputs.releaseId', hosted)
+        self.assertIn('if: always()', hosted)
+        self.assertIn(f'ref: {PIN}', hosted)
+        self.assertEqual(hosted.count('persist-credentials: false'), 2)
+        self.assertEqual(contract.count('"tests/fixtures/confidential-hosted/**"'), 2)
+        for forbidden in ('secrets.', 'contents: write', 'upload-artifact', 'workflow_dispatch:',
+                          'repository_dispatch:', 'workflow_run:', 'gh release', 'ECHO_TAURI_DEPLOY_KEY'):
+            self.assertNotIn(forbidden, contract)
+        uses = re.findall(r'uses: (.+)', hosted)
+        self.assertEqual(set(uses), {'./.github/actions/confidential-tauri',
+                                    'actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1'})
+
+    @unittest.skipUnless(shutil.which('node'), 'Node required for portable hosted fixture')
+    def test_portable_hosted_probe_locally(self):
+        result = subprocess.run(['node', str(ROOT / 'tests/fixtures/confidential-hosted/probe.cjs'), 'local'],
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Unwrapped 37 control:', result.stdout)
+        self.assertIn('cleanup passed.', result.stdout)
+
     def test_clippy_fallback_stays_advisory_but_second_failure_blocks(self):
         block = run_block(self.texts['pr-check'], '- name: clippy (advisory)')
         for fallback_status in (0, 101):
