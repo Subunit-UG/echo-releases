@@ -17,6 +17,9 @@ on:
       - "scripts/verify-platform-macos.sh"
       - "scripts/verify-platform-windows.ps1"
       - "tests/test_release_workflow.py"
+      - "tests/test_confidential_output.py"
+      - "scripts/run-confidential.sh"
+      - ".github/actions/confidential-tauri/**"
       - "README.md"
       - "docs/PLATFORM-TRUST.md"
   push:
@@ -36,6 +39,9 @@ on:
       - "scripts/verify-platform-macos.sh"
       - "scripts/verify-platform-windows.ps1"
       - "tests/test_release_workflow.py"
+      - "tests/test_confidential_output.py"
+      - "scripts/run-confidential.sh"
+      - ".github/actions/confidential-tauri/**"
       - "README.md"
       - "docs/PLATFORM-TRUST.md"
 
