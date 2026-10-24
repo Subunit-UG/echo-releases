@@ -280,6 +280,10 @@ jobs:
     if: needs.prepare.outputs.should_build == 'true'
     permissions:
       contents: write
+      id-token: write # Tauri signs during bundling; no OIDC access in publish/verification jobs.
+    env:
+      WINDOWS_SIGNING_BACKEND: ${{ vars.WINDOWS_SIGNING_BACKEND || 'none' }}
+      WINDOWS_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER }}
     strategy:
       fail-fast: false
       matrix:
@@ -295,6 +299,30 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
+      - name: Validate Windows signing backend
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_CERTIFICATE_PROFILE: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+          AZURE_KEY_VAULT_CERTIFICATE_URL: ${{ vars.AZURE_KEY_VAULT_CERTIFICATE_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          switch -CaseSensitive ($env:WINDOWS_SIGNING_BACKEND) {
+            'none' { exit 0 }
+            'artifact-signing' { $settings = @('ARTIFACT_SIGNING_ENDPOINT', 'ARTIFACT_SIGNING_ACCOUNT', 'ARTIFACT_SIGNING_CERTIFICATE_PROFILE') }
+            'azure-key-vault' { $settings = @('AZURE_KEY_VAULT_CERTIFICATE_URL') }
+            default { throw 'Unknown WINDOWS_SIGNING_BACKEND' }
+          }
+          $settings += @('AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SUBSCRIPTION_ID', 'WINDOWS_PUBLISHER')
+          foreach ($name in $settings) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Missing signing setting: $name" }
+          }
+
       # Privaten Quellcode (echo-tauri@ref) auschecken — MANUELLER git clone per
       # read-only Deploy-Key, NICHT actions/checkout mit ssh-key: dessen SSH-Handling
       # bricht auf windows-11-arm (Permission denied publickey). Der manuelle Weg
@@ -513,12 +541,91 @@ jobs:
       - shell: bash
         run: bash _release-ci/scripts/run-confidential.sh npm ci
 
+      - name: Azure OIDC login for Windows signing
+        if: runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' || vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')
+        uses: azure/login@8216e11d8cd9b42fe925c852af8e76311ff067ac # v2, immutable
+        env:
+          AZURE_CORE_OUTPUT: none
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prepare Windows cloud signing
+        id: windows-signing
+        if: runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' || vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')
+        shell: pwsh
+        env:
+          AZURE_KEY_VAULT_CERTIFICATE_URL: ${{ vars.AZURE_KEY_VAULT_CERTIFICATE_URL }}
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_CERTIFICATE_PROFILE: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_PUBLISHER)) { throw 'WINDOWS_PUBLISHER is required for cloud signing' }
+          $signing = Join-Path $env:RUNNER_TEMP 'windows-signing'
+          New-Item -ItemType Directory -Path $signing | Out-Null
+          $configPath = Join-Path $signing 'provider.json'
+          switch -CaseSensitive ($env:WINDOWS_SIGNING_BACKEND) {
+            'azure-key-vault' {
+              $relic = Join-Path $signing 'relic.exe'
+              Invoke-WebRequest 'https://github.com/sassoftware/relic/releases/download/v8.2.0/relic-windows-amd64.exe' -OutFile $relic
+              if ((Get-FileHash $relic -Algorithm SHA256).Hash.ToLowerInvariant() -ne '1411ca46a792483f200b744df9fba20bb32179d831f77264d8157f0f445a6082') { throw 'relic checksum mismatch' }
+              & $relic --version
+              if ($LASTEXITCODE -ne 0) { throw 'relic cannot start on this runner' }
+              # Empty PIN selects AzureCLICredential, using azure/login's OIDC session.
+              @{
+                tokens = @{ azure = @{ type = 'azure'; pin = '' } }
+                keys = @{ azure = @{ token = 'azure'; id = $env:AZURE_KEY_VAULT_CERTIFICATE_URL; timestamp = $true } }
+                timestamp = @{ urls = @('http://timestamp.acs.microsoft.com') }
+              } | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM $configPath
+              "RELIC_PATH=$relic" >> $env:GITHUB_ENV
+            }
+            'artifact-signing' {
+              throw 'artifact-signing-cli 0.12.0 requires a client secret; OIDC implementation decision pending'
+            }
+            default { throw 'Unsupported cloud signing backend' }
+          }
+          "WINDOWS_SIGNING_CONFIG=$configPath" >> $env:GITHUB_ENV
+          $scriptPath = Join-Path $signing 'sign.ps1'
+          @'
+          param([Parameter(Mandatory = $true)][string] $ArtifactPath)
+          $ErrorActionPreference = 'Stop'
+          switch -CaseSensitive ($env:WINDOWS_SIGNING_BACKEND) {
+            'azure-key-vault' {
+              & $env:RELIC_PATH sign --file $ArtifactPath --key azure --config $env:WINDOWS_SIGNING_CONFIG --digest sha256
+            }
+            default { throw 'Unsupported signing backend' }
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Windows signing command failed' }
+          # Verify each file before Tauri can place it inside an installer or upload it.
+          $signature = Get-AuthenticodeSignature -LiteralPath $ArtifactPath
+          if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or
+              $signature.SignerCertificate.Subject -cne $env:WINDOWS_PUBLISHER -or
+              -not $signature.TimeStamperCertificate) {
+            throw 'Signed file failed Authenticode, publisher or timestamp verification'
+          }
+          '@ | Set-Content -Encoding utf8NoBOM $scriptPath
+          @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $null
+                signCommand = @{
+                  cmd = 'pwsh'
+                  args = @('-NoProfile', '-NonInteractive', '-File', $scriptPath, '%1')
+                }
+              }
+            }
+          } | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM 'src-tauri/tauri.windows-signing.json'
+          'args=--config src-tauri/tauri.windows-signing.json' >> $env:GITHUB_OUTPUT
+
       - name: macOS signing keychain (stable self-signed cert — keeps TCC grants across updates)
         if: matrix.platform == 'macos-14'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARIZE_METHOD: ${{ vars.APPLE_NOTARIZE_METHOD }}
         run: |
           set -euo pipefail
           if [ -z "${APPLE_CERTIFICATE:-}" ] || [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
@@ -533,12 +640,66 @@ jobs:
             -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k ci build.keychain > /dev/null
-          security find-certificate -c "$APPLE_SIGNING_IDENTITY" -p build.keychain > /tmp/echo-sign.pem
-          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
-            -k /Library/Keychains/System.keychain /tmp/echo-sign.pem
+          if [ -z "$APPLE_NOTARIZE_METHOD" ]; then
+            security find-certificate -c "$APPLE_SIGNING_IDENTITY" -p build.keychain > /tmp/echo-sign.pem
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+              -k /Library/Keychains/System.keychain /tmp/echo-sign.pem
+          fi
           rm /tmp/echo-sign.p12
           echo "valid codesigning identities now:"
           security find-identity -v -p codesigning build.keychain
+
+      - name: Configure explicitly enabled macOS notarization
+        if: matrix.platform == 'macos-14' && vars.APPLE_NOTARIZE_METHOD != ''
+        shell: bash
+        env:
+          APPLE_NOTARIZE_METHOD: ${{ vars.APPLE_NOTARIZE_METHOD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do
+            [ -n "${!name:-}" ] || { echo "::error::Notarization requires $name"; exit 1; }
+          done
+          case "$APPLE_SIGNING_IDENTITY" in
+            "Developer ID Application:"*) ;;
+            *) echo "::error::Notarization requires Developer ID Application"; exit 1 ;;
+          esac
+          case "$APPLE_NOTARIZE_METHOD" in
+            apple-id)
+              for name in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+                [ -n "${!name:-}" ] || { echo "::error::Notarization requires $name"; exit 1; }
+              done
+              {
+                echo "APPLE_ID=$APPLE_ID"
+                echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+                echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+              } >> "$GITHUB_ENV"
+              ;;
+            api-key)
+              for name in APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY; do
+                [ -n "${!name:-}" ] || { echo "::error::Notarization requires $name"; exit 1; }
+              done
+              api_key_path="$RUNNER_TEMP/notarization-key.p8"
+              test ! -e "$api_key_path"
+              umask 077
+              printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$api_key_path"
+              chmod 600 "$api_key_path"
+              {
+                echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
+                echo "APPLE_API_KEY=$APPLE_API_KEY"
+                echo "APPLE_API_KEY_PATH=$api_key_path"
+              } >> "$GITHUB_ENV"
+              ;;
+            *) echo "::error::Unknown APPLE_NOTARIZE_METHOD"; exit 1 ;;
+          esac
 
       - uses: ./_release-ci/.github/actions/confidential-tauri
         env:
@@ -555,7 +716,46 @@ jobs:
           tagName: ${{ needs.prepare.outputs.tag }}
           releaseDraft: true
           prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
-          args: ${{ matrix.args }}
+          args: ${{ matrix.args }}${{ steps.windows-signing.outputs.args && format(' {0}', steps.windows-signing.outputs.args) || '' }}
+
+      - name: Verify enabled Windows signing before release gates
+        if: runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' || vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'src-tauri/target/release'
+          $files = @(
+            Get-ChildItem $root -Filter '*.exe' -File
+            Get-ChildItem "$root/bundle/nsis" -Filter '*.exe' -File
+          ) | Sort-Object FullName -Unique
+          if ($files.Count -lt 2) { throw 'Application and NSIS installer must both exist' }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_PUBLISHER)) { throw 'WINDOWS_PUBLISHER is required' }
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or
+                $signature.SignerCertificate.Subject -cne $env:WINDOWS_PUBLISHER -or
+                -not $signature.TimeStamperCertificate) {
+              throw 'Windows artifact failed Authenticode, publisher or timestamp verification'
+            }
+          }
+
+      - name: Verify explicitly enabled macOS notarization
+        if: matrix.platform == 'macos-14' && vars.APPLE_NOTARIZE_METHOD != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=src-tauri/target/aarch64-apple-darwin/release/bundle
+          app=$(find "$root/macos" -maxdepth 1 -name '*.app' -print -quit)
+          dmg=$(find "$root/dmg" -maxdepth 1 -name '*.dmg' -print -quit)
+          test -n "$app" && test -n "$dmg"
+          codesign --verify --deep --strict "$app"
+          xcrun stapler validate "$app"
+          xcrun stapler validate "$dmg"
+
+      - name: Remove notarization API key
+        if: always() && matrix.platform == 'macos-14' && vars.APPLE_NOTARIZE_METHOD == 'api-key'
+        shell: bash
+        run: rm -f -- "$RUNNER_TEMP/notarization-key.p8"
 
   verify_updater_trust:
     needs: [prepare, reserve, build]
