@@ -107,12 +107,14 @@ jobs:
       && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    # gleiche Gruppe wie auto-freigabe.yml: ein laufender Freigabe-Lauf wird abgebrochen,
-    # damit er nach der Rücknahme keine Freigabe mehr setzen kann
+    # eigene Gruppe ohne Abbruch: kein anderer Lauf kann die Rücknahme abbrechen (fail-closed);
+    # laufende Freigabe-Läufe bricht der Job selbst ab, und auto-freigabe.yml prüft das
+    # letzte Urteil unmittelbar vor dem Freigeben noch einmal
     concurrency:
-      group: auto-freigabe-${{ github.event.issue.number }}
-      cancel-in-progress: true
+      group: nogo-zuruecknehmen-${{ github.event.issue.number }}
+      cancel-in-progress: false
     permissions:
+      actions: write
       pull-requests: write
     env:
       GH_TOKEN: ${{ github.token }}
@@ -131,6 +133,12 @@ jobs:
             "Gate-Urteil: NO-GO "*) ;;
             *) echo "Letztes Urteil am Head $head ist kein NO-GO, nichts zu tun"; exit 0 ;;
           esac
+          # laufende oder wartende Freigabe-Läufe am Head zuerst abbrechen
+          for lauf in $(gh api "repos/$REPO/actions/workflows/auto-freigabe.yml/runs?head_sha=$head&per_page=100" \
+              -q '.workflow_runs[] | select(.status != "completed") | .id'); do
+            gh api -X POST "repos/$REPO/actions/runs/$lauf/cancel" >/dev/null || true
+            echo "Freigabe-Lauf $lauf abgebrochen"
+          done
           ids=$(gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" --paginate \
             -q '.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED") | .id')
           for id in $ids; do

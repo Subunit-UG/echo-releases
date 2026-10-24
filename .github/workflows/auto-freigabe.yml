@@ -17,7 +17,7 @@
 #   grün gilt und was mit Signier-Geheimnissen läuft), definiert er sein Grün selbst. Dann gibt es die Freigabe erst mit
 #   dem Gate-Urteil einer zweiten Instanz am exakten Head (Canon Release-Gate): eine
 #   Kommentarzeile "Gate-Urteil: GO <voller Head-SHA>". Ein späteres NO-GO am selben Head hebt
-#   ein früheres GO auf. Prozess-Mauer gegen stilles
+#   ein früheres GO auf und sperrt jeden PR (auch ohne geschützte Pfade) direkt vor dem Freigeben. Prozess-Mauer gegen stilles
 #   Aufweichen durch Agenten, kein Schutz gegen böswillige Schreibrechte (gleiche Identität).
 # - Neue Testläufe und Gate-Urteile stoßen eine fehlgeschlagene Freigabe von selbst neu an
 #   (auto-freigabe-nachlauf.yml); niemand muss von Hand neu starten.
@@ -98,6 +98,13 @@ jobs:
           if [ "$state" != "open" ] || [ "$head" != "$SHA" ] || [ "$draft" != "false" ]; then
             echo "::notice::PR geändert (state=$state head=$head draft=$draft), keine Freigabe für $SHA"; exit 0
           fi
+          # ein NO-GO als letztes Urteil am Head sperrt jeden PR, unmittelbar vor dem Freigeben geprüft
+          letztes=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
+              -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body' \
+            | tr -d '\r' | grep -E "^Gate-Urteil: (GO|NO-GO) $SHA([^0-9a-f]|$)" | tail -n 1 || true)
+          case "$letztes" in
+            "Gate-Urteil: NO-GO "*) echo "::error::Letztes Gate-Urteil am Head $SHA ist NO-GO, keine Freigabe"; exit 1 ;;
+          esac
           gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f commit_id="$SHA" -f event=APPROVE \
             -f body="Automatische Freigabe: volle Testsuite und alle übrigen Checks grün am Head \`$SHA\`." >/dev/null
           echo "Freigegeben: PR #$PR am $SHA"
