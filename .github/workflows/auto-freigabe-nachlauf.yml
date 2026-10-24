@@ -66,7 +66,7 @@ jobs:
           if [ "$EREIGNIS" = "issue_comment" ]; then
             # Abruf allein: ein API-Fehler bricht den Schritt ab (fail-closed), nur "kein Treffer" ist ok
             urteile=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
-              -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body | gsub("\r"; "") | split("\n") | map(select(test("^Gate-Urteil: (GO|NO-GO) "))) | .[0] // empty')
+              -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | (.body // "") | gsub("\r"; "") | split("\n") | map(select(test("^Gate-Urteil: (GO|NO-GO) "))) | .[0] // empty')
             letztes=$(printf '%s\n' "$urteile" | tr -d '\r' | { grep -E "^Gate-Urteil: (GO|NO-GO) $head([^0-9a-f]|$)" || true; } | tail -n 1)
             case "$letztes" in
               "Gate-Urteil: GO "*) ;;
@@ -107,7 +107,8 @@ jobs:
       && contains(github.event.comment.body, 'Gate-Urteil: NO-GO')
       && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # Wiederholungen plus bis zu 3 min Warten auf abgebrochene Läufe
+    timeout-minutes: 10
     # eigene Gruppe ohne Abbruch: kein anderer Lauf kann die Rücknahme abbrechen (fail-closed);
     # laufende Freigabe-Läufe bricht der Job selbst ab, und auto-freigabe.yml prüft das
     # letzte Urteil unmittelbar vor dem Freigeben noch einmal
@@ -125,22 +126,23 @@ jobs:
       - name: Bot-Freigabe zurückziehen, wenn das letzte Urteil am Head NO-GO ist
         run: |
           set -euo pipefail
-          head=$(gh api "repos/$REPO/pulls/$PR" -q .head.sha)
+          # API-Aufrufe mit Wiederholung; scheitert die Rücknahme endgültig, wird der Job rot
+          nochmal() { for i in 1 2 3 4; do "$@" && return 0; sleep $((i * 5)); done; return 1; }
+          head=$(nochmal gh api "repos/$REPO/pulls/$PR" -q .head.sha)
           [ -n "$head" ]
           # gleiche Regel wie in auto-freigabe.yml: das letzte Urteil am exakten Head gilt
           # Abruf allein: ein API-Fehler bricht den Schritt ab (fail-closed), nur "kein Treffer" ist ok
-          urteile=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
-            -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body | gsub("\r"; "") | split("\n") | map(select(test("^Gate-Urteil: (GO|NO-GO) "))) | .[0] // empty')
+          urteile=$(nochmal gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
+            -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | (.body // "") | gsub("\r"; "") | split("\n") | map(select(test("^Gate-Urteil: (GO|NO-GO) "))) | .[0] // empty')
           letztes=$(printf '%s\n' "$urteile" | tr -d '\r' | { grep -E "^Gate-Urteil: (GO|NO-GO) $head([^0-9a-f]|$)" || true; } | tail -n 1)
           case "$letztes" in
             "Gate-Urteil: NO-GO "*) ;;
             *) echo "Letztes Urteil am Head $head ist kein NO-GO, nichts zu tun"; exit 0 ;;
           esac
-          # API-Aufrufe mit Wiederholung; scheitert die Rücknahme endgültig, wird der Job rot
-          nochmal() { for i in 1 2 3 4; do "$@" && return 0; sleep $((i * 5)); done; return 1; }
           zuruecknehmen() {
+            # sort -u: ein Wiederholungsversuch kann Seiten doppelt ausgeben
             ids=$(nochmal gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" --paginate \
-              -q '.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED") | .id')
+              -q '.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED") | .id' | sort -u)
             for id in $ids; do
               nochmal gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$id/dismissals" \
                 -f message="Gate-Urteil NO-GO am Head $head: automatische Freigabe zurückgezogen." -f event=DISMISS >/dev/null
