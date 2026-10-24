@@ -1,0 +1,76 @@
+# Nachlauf der automatischen Freigabe: grün darf nie an einem Neustart hängen (TJ 2026-10-24).
+#
+# Stößt eine fehlgeschlagene oder abgebrochene "Automatische Freigabe" am aktuellen Head neu an,
+# - sobald die Freigabe-Tests dort grün durchgelaufen sind (z. B. nach einem Neustart eines
+#   wackligen Tests), oder
+# - sobald ein Gate-Urteil ("Gate-Urteil: GO <Head-SHA>") als Kommentar eingeht.
+#
+# Ein Neustart nutzt die Workflow-Definition des ursprünglichen Laufs. Deshalb startet der
+# Nachlauf nur Läufe neu, die NACH der letzten Änderung an auto-freigabe.yml auf main begonnen
+# haben; ältere Läufe könnten eine überholte, schwächere Prüfung wiederholen (Gate 2026-10-24).
+#
+# SICHERHEIT: Läuft aus main (workflow_run / issue_comment), checkt keinen Code aus, liest
+# keine Kommentartexte in Befehle ein und darf nur Läufe neu starten (actions: write).
+# Kommentare zählen nur von OWNER/MEMBER/COLLABORATOR, nie von Fremden im öffentlichen Repo.
+
+name: Automatische Freigabe – Nachlauf
+
+on:
+  workflow_run:
+    workflows: [Freigabe-Tests]
+    types: [completed]
+  issue_comment:
+    types: [created, edited]
+
+permissions: {}
+
+jobs:
+  neu-anstossen:
+    name: Freigabe neu anstoßen
+    if: >-
+      (github.event_name == 'workflow_run'
+        && github.event.workflow_run.event == 'pull_request'
+        && github.event.workflow_run.conclusion == 'success')
+      || (github.event_name == 'issue_comment'
+        && github.event.issue.pull_request
+        && contains(github.event.comment.body, 'Gate-Urteil: GO')
+        && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      EREIGNIS: ${{ github.event_name }}
+      RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+      KOMMENTAR_PR: ${{ github.event.issue.number }}
+    steps:
+      - name: Letzte Freigabe am Head prüfen und bei Bedarf neu starten
+        run: |
+          set -euo pipefail
+          if [ "$EREIGNIS" = "workflow_run" ]; then PR="$RUN_PR"; else PR="$KOMMENTAR_PR"; fi
+          # Fork-PRs liefern keine PR-Nummer: dort gibt es ohnehin keine automatische Freigabe
+          if [ -z "$PR" ]; then echo "Kein PR aus diesem Repo"; exit 0; fi
+          read -r state head draft < <(gh api "repos/$REPO/pulls/$PR" -q '[.state, .head.sha, .draft] | @tsv')
+          if [ "$state" != "open" ] || [ "$draft" != "false" ]; then echo "PR #$PR nicht offen oder Entwurf"; exit 0; fi
+          # ein Testlauf an einem älteren Head zählt nicht
+          if [ "$EREIGNIS" = "workflow_run" ] && [ "$RUN_SHA" != "$head" ]; then echo "Testlauf nicht am aktuellen Head"; exit 0; fi
+          letzter=$(gh api "repos/$REPO/actions/workflows/auto-freigabe.yml/runs?head_sha=$head&event=pull_request_target&per_page=100" \
+            -q '.workflow_runs | sort_by(.id) | last | select(. != null) | [.id, .status, (.conclusion // "-"), .created_at] | @tsv')
+          if [ -z "$letzter" ]; then echo "Noch keine Freigabe am Head $head"; exit 0; fi
+          read -r id status conclusion erstellt <<<"$letzter"
+          definition=$(gh api "repos/$REPO/commits?sha=main&path=.github/workflows/auto-freigabe.yml&per_page=1" -q '.[0].commit.committer.date')
+          # ISO-8601 in UTC ist lexikografisch vergleichbar
+          if [[ "$erstellt" < "$definition" ]]; then
+            echo "::warning::Freigabe-Lauf $id ($erstellt) stammt von einer älteren Definition ($definition); Neustart würde die alte Prüfung wiederholen. Neu pushen oder PR schließen und wieder öffnen."
+            exit 0
+          fi
+          case "$status/$conclusion" in
+            completed/failure|completed/cancelled|completed/timed_out)
+              gh api -X POST "repos/$REPO/actions/runs/$id/rerun" >/dev/null
+              echo "Freigabe-Lauf $id ($conclusion) am Head $head neu gestartet" ;;
+            *) echo "Freigabe-Lauf $id ist $status/$conclusion, nichts zu tun" ;;
+          esac
