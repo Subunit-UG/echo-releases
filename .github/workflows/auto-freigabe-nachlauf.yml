@@ -66,7 +66,7 @@ jobs:
           if [ "$EREIGNIS" = "issue_comment" ]; then
             # Abruf allein: ein API-Fehler bricht den Schritt ab (fail-closed), nur "kein Treffer" ist ok
             urteile=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
-              -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body')
+              -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body | gsub("\r"; "") | split("\n") | map(select(test("^Gate-Urteil: (GO|NO-GO) "))) | .[0] // empty')
             letztes=$(printf '%s\n' "$urteile" | tr -d '\r' | { grep -E "^Gate-Urteil: (GO|NO-GO) $head([^0-9a-f]|$)" || true; } | tail -n 1)
             case "$letztes" in
               "Gate-Urteil: GO "*) ;;
@@ -126,18 +126,32 @@ jobs:
         run: |
           set -euo pipefail
           head=$(gh api "repos/$REPO/pulls/$PR" -q .head.sha)
+          [ -n "$head" ]
           # gleiche Regel wie in auto-freigabe.yml: das letzte Urteil am exakten Head gilt
           # Abruf allein: ein API-Fehler bricht den Schritt ab (fail-closed), nur "kein Treffer" ist ok
           urteile=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
-            -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body')
+            -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body | gsub("\r"; "") | split("\n") | map(select(test("^Gate-Urteil: (GO|NO-GO) "))) | .[0] // empty')
           letztes=$(printf '%s\n' "$urteile" | tr -d '\r' | { grep -E "^Gate-Urteil: (GO|NO-GO) $head([^0-9a-f]|$)" || true; } | tail -n 1)
           case "$letztes" in
             "Gate-Urteil: NO-GO "*) ;;
             *) echo "Letztes Urteil am Head $head ist kein NO-GO, nichts zu tun"; exit 0 ;;
           esac
-          # laufende oder wartende Freigabe-Läufe am Head zuerst abbrechen
-          # und abwarten, bis sie wirklich beendet sind (Abbruch ist asynchron); sonst Fehler
-          offen() { gh api "repos/$REPO/actions/workflows/auto-freigabe.yml/runs?head_sha=$head&per_page=100" \
+          # API-Aufrufe mit Wiederholung; scheitert die Rücknahme endgültig, wird der Job rot
+          nochmal() { for i in 1 2 3 4; do "$@" && return 0; sleep $((i * 5)); done; return 1; }
+          zuruecknehmen() {
+            ids=$(nochmal gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" --paginate \
+              -q '.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED") | .id')
+            for id in $ids; do
+              nochmal gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$id/dismissals" \
+                -f message="Gate-Urteil NO-GO am Head $head: automatische Freigabe zurückgezogen." -f event=DISMISS >/dev/null
+              echo "Bot-Freigabe $id zurückgezogen"
+            done
+          }
+          # 1. sofort zurückziehen, unabhängig von allem Weiteren
+          zuruecknehmen
+          # 2. laufende oder wartende Freigabe-Läufe am Head abbrechen und abwarten, bis sie
+          #    wirklich beendet sind (Abbruch ist asynchron); sonst Fehler
+          offen() { nochmal gh api "repos/$REPO/actions/workflows/auto-freigabe.yml/runs?head_sha=$head&per_page=100" \
               -q '.workflow_runs[] | select(.status != "completed") | .id'; }
           for _ in $(seq 1 18); do
             laeufe=$(offen)
@@ -149,11 +163,7 @@ jobs:
             done
             sleep 10
           done
-          if [ -n "$(offen)" ]; then echo "::error::Freigabe-Läufe am Head $head nach 3 min nicht beendet"; exit 1; fi
-          ids=$(gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" --paginate \
-            -q '.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED") | .id')
-          for id in $ids; do
-            gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$id/dismissals" \
-              -f message="Gate-Urteil NO-GO am Head $head: automatische Freigabe zurückgezogen." -f event=DISMISS >/dev/null
-            echo "Bot-Freigabe $id zurückgezogen"
-          done
+          # 3. noch einmal zurückziehen: erfasst Freigaben, die ein Lauf vor seinem Ende noch gesetzt hat
+          zuruecknehmen
+          laeufe=$(offen)
+          if [ -n "$laeufe" ]; then echo "::error::Freigabe-Läufe am Head $head nach 3 min nicht beendet: $laeufe"; exit 1; fi

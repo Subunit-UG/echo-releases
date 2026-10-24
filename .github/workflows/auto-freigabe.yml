@@ -87,7 +87,7 @@ jobs:
           if [ -z "$geschuetzt" ]; then echo "Keine Änderung unter .github/ oder scripts/"; exit 0; fi
           echo "Geschützte Pfade geändert:"; printf '%s\n' "$geschuetzt"
           if gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
-               -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body' \
+               -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body | gsub("\r"; "") | split("\n") | map(select(test("^Gate-Urteil: (GO|NO-GO) "))) | .[0] // empty' \
              | tr -d '\r' | grep -E "^Gate-Urteil: (GO|NO-GO) $SHA([^0-9a-f]|$)" | tail -n 1 | grep -q '^Gate-Urteil: GO '; then
             echo "Gate-Urteil GO am Head $SHA liegt vor"; exit 0
           fi
@@ -103,7 +103,7 @@ jobs:
           # ein NO-GO als letztes Urteil am Head sperrt jeden PR, unmittelbar vor dem Freigeben geprüft
           # Abruf allein: ein API-Fehler bricht den Schritt ab (fail-closed), nur "kein Treffer" ist ok
           urteile=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
-            -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body')
+            -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body | gsub("\r"; "") | split("\n") | map(select(test("^Gate-Urteil: (GO|NO-GO) "))) | .[0] // empty')
           letztes=$(printf '%s\n' "$urteile" | tr -d '\r' | { grep -E "^Gate-Urteil: (GO|NO-GO) $SHA([^0-9a-f]|$)" || true; } | tail -n 1)
           case "$letztes" in
             "Gate-Urteil: NO-GO "*) echo "::error::Letztes Gate-Urteil am Head $SHA ist NO-GO, keine Freigabe"; exit 1 ;;
@@ -112,7 +112,7 @@ jobs:
             -f body="Automatische Freigabe: volle Testsuite und alle übrigen Checks grün am Head \`$SHA\`." -q .id > review-id
           # Nachkontrolle: kam währenddessen ein NO-GO, nimmt sich die Freigabe selbst zurück
           urteile=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
-            -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body')
+            -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body | gsub("\r"; "") | split("\n") | map(select(test("^Gate-Urteil: (GO|NO-GO) "))) | .[0] // empty')
           letztes=$(printf '%s\n' "$urteile" | tr -d '\r' | { grep -E "^Gate-Urteil: (GO|NO-GO) $SHA([^0-9a-f]|$)" || true; } | tail -n 1)
           case "$letztes" in
             "Gate-Urteil: NO-GO "*)
