@@ -1,0 +1,72 @@
+# Automatische Freigabe: grüne PRs blockieren nie (TJ 2026-10-24).
+#
+# main verlangt eine Freigabe einer anderen Identität (Branch-Schutz seit 2026-10-23).
+# Diese Freigabe gibt github-actions[bot], sobald die volle Testsuite und ALLE übrigen
+# Checks am exakten Head grün sind. Keine Rückfrage, kein Klick.
+#
+# SICHERHEIT:
+# - pull_request_target: Definition kommt immer aus main; ein PR kann die Freigabe-Logik
+#   für sich selbst nicht umschreiben.
+# - Dieser Workflow checkt KEINEN PR-Code aus und führt keinen aus (sonst Cache-Vergiftung
+#   von main möglich, Gate 2026-10-24). Die Tests laufen getrennt in freigabe-tests.yml
+#   unter pull_request; hier wird nur auf deren Ergebnis gewartet.
+# - Der Check-Run "Volle Testsuite" muss am exakten Head existieren und grün sein.
+# - Nur PRs aus diesem Repo (Schreibrecht nötig), nie aus Forks; keine Entwürfe.
+# - "Volle Testsuite" und "Automatische Freigabe" sind Pflicht-Checks auf main.
+
+name: Automatische Freigabe
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: auto-freigabe-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  freigeben:
+    name: Automatische Freigabe
+    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      pull-requests: write
+      checks: read
+      statuses: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Auf volle Testsuite und alle übrigen Checks am exakten Head warten
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 140); do
+            # der eigene Job (auch aus früheren Läufen am selben Head) zählt nicht mit
+            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
+              -q '.check_runs[] | select(.name != "Automatische Freigabe") | [.id, .name, .status, (.conclusion // "-")] | @tsv')
+            # die volle Testsuite ist Pflicht: fehlt ihr Check-Run noch, weiter warten
+            if ! printf '%s\n' "$runs" | awk -F'\t' '$2=="Volle Testsuite"{f=1} END{exit !f}'; then sleep 30; continue; fi
+            states=$(gh api "repos/$REPO/commits/$SHA/status" -q '.statuses[] | [.context, .state] | @tsv')
+            pending=$(printf '%s\n' "$runs" | awk -F'\t' 'NF && $3!="completed"' ; printf '%s\n' "$states" | awk -F'\t' 'NF && $2=="pending"')
+            bad=$(printf '%s\n' "$runs" | awk -F'\t' 'NF && $3=="completed" && $4!="success" && $4!="skipped" && $4!="neutral"' ; printf '%s\n' "$states" | awk -F'\t' 'NF && ($2=="failure" || $2=="error")')
+            if [ -n "$bad" ]; then echo "::error::Nicht grün, keine Freigabe:"; printf '%s\n' "$bad"; exit 1; fi
+            if [ -z "$pending" ]; then echo "Volle Testsuite und alle übrigen Checks grün:"; printf '%s\n' "$runs" | cut -f2,4; exit 0; fi
+            sleep 30
+          done
+          echo "::error::Zeitüberschreitung: Checks nach 70 min nicht fertig"; exit 1
+      - name: Freigeben, wenn der Head unverändert ist
+        run: |
+          set -euo pipefail
+          read -r state head draft < <(gh api "repos/$REPO/pulls/$PR" -q '[.state, .head.sha, .draft] | @tsv')
+          if [ "$state" != "open" ] || [ "$head" != "$SHA" ] || [ "$draft" != "false" ]; then
+            echo "::notice::PR geändert (state=$state head=$head draft=$draft), keine Freigabe für $SHA"; exit 0
+          fi
+          gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f commit_id="$SHA" -f event=APPROVE \
+            -f body="Automatische Freigabe: volle Testsuite und alle übrigen Checks grün am Head \`$SHA\`." >/dev/null
+          echo "Freigegeben: PR #$PR am $SHA"
