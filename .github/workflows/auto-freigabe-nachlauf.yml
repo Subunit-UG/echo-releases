@@ -62,6 +62,16 @@ jobs:
           if [ "$state" != "open" ] || [ "$draft" != "false" ]; then echo "PR #$PR nicht offen oder Entwurf"; exit 0; fi
           # ein Testlauf an einem älteren Head zählt nicht
           if [ "$EREIGNIS" = "workflow_run" ] && [ "$RUN_SHA" != "$head" ]; then echo "Testlauf nicht am aktuellen Head"; exit 0; fi
+          # ein Kommentar stößt nur an, wenn das letzte Urteil am exakten Head GO ist (wie in auto-freigabe.yml)
+          if [ "$EREIGNIS" = "issue_comment" ]; then
+            letztes=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
+                -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body' \
+              | tr -d '\r' | grep -E "^Gate-Urteil: (GO|NO-GO) $head([^0-9a-f]|$)" | tail -n 1 || true)
+            case "$letztes" in
+              "Gate-Urteil: GO "*) ;;
+              *) echo "Letztes Urteil am Head $head ist kein GO, nichts anzustoßen"; exit 0 ;;
+            esac
+          fi
           letzter=$(gh api "repos/$REPO/actions/workflows/auto-freigabe.yml/runs?head_sha=$head&event=pull_request_target&per_page=100" \
             -q '.workflow_runs | sort_by(.id) | last | select(. != null) | [.id, .status, (.conclusion // "-"), .created_at] | @tsv')
           if [ -z "$letzter" ]; then echo "Noch keine Freigabe am Head $head"; exit 0; fi
@@ -97,6 +107,11 @@ jobs:
       && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # gleiche Gruppe wie auto-freigabe.yml: ein laufender Freigabe-Lauf wird abgebrochen,
+    # damit er nach der Rücknahme keine Freigabe mehr setzen kann
+    concurrency:
+      group: auto-freigabe-${{ github.event.issue.number }}
+      cancel-in-progress: true
     permissions:
       pull-requests: write
     env:
