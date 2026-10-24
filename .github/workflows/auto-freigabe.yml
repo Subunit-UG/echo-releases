@@ -13,6 +13,13 @@
 # - Der Check-Run "Volle Testsuite" muss am exakten Head existieren und grün sein.
 # - Nur PRs aus diesem Repo (Schreibrecht nötig), nie aus Forks; keine Entwürfe.
 # - "Volle Testsuite" und "Automatische Freigabe" sind Pflicht-Checks auf main.
+# - Ändert ein PR etwas unter .github/ (Prüf- und Release-Weg selbst, Zugriff auf
+#   Signier-Geheimnisse), definiert er sein Grün selbst. Dann gibt es die Freigabe erst mit
+#   dem Gate-Urteil einer zweiten Instanz am exakten Head (Canon Release-Gate): eine
+#   Kommentarzeile "Gate-Urteil: GO <voller Head-SHA>". Prozess-Mauer gegen stilles
+#   Aufweichen durch Agenten, kein Schutz gegen böswillige Schreibrechte (gleiche Identität).
+# - Neue Testläufe und Gate-Urteile stoßen eine fehlgeschlagene Freigabe von selbst neu an
+#   (auto-freigabe-nachlauf.yml); niemand muss von Hand neu starten.
 
 name: Automatische Freigabe
 
@@ -48,11 +55,15 @@ jobs:
           set -euo pipefail
           for _ in $(seq 1 140); do
             # der eigene Job (auch aus früheren Läufen am selben Head) zählt nicht mit
-            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
-              -q '.check_runs[] | select(.name != "Automatische Freigabe") | [.id, .name, .status, (.conclusion // "-")] | @tsv')
+            # abgebrochene Läufe zählen nicht, wenn es danach einen neueren gleichnamigen gibt
+            # (Abbruch durch cancel-in-progress); ein roter Lauf wird nie ausgeblendet
+            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100&filter=all" --paginate \
+              -q '.check_runs[] | select(.name != "Automatische Freigabe") | [.id, .name, .status, (.conclusion // "-")] | @tsv' \
+              | awk -F'\t' 'NF{row[NR]=$0; id[NR]=$1; nm[NR]=$2; c[NR]=$4; if($1>max[$2]) max[$2]=$1}
+                  END{for(i in row) if(!(c[i]=="cancelled" && id[i]<max[nm[i]])) print row[i]}')
             # die volle Testsuite ist Pflicht: fehlt ihr Check-Run noch, weiter warten
             if ! printf '%s\n' "$runs" | awk -F'\t' '$2=="Volle Testsuite"{f=1} END{exit !f}'; then sleep 30; continue; fi
-            states=$(gh api "repos/$REPO/commits/$SHA/status" -q '.statuses[] | [.context, .state] | @tsv')
+            states=$(gh api "repos/$REPO/commits/$SHA/status?per_page=100" --paginate -q '.statuses[] | [.context, .state] | @tsv')
             pending=$(printf '%s\n' "$runs" | awk -F'\t' 'NF && $3!="completed"' ; printf '%s\n' "$states" | awk -F'\t' 'NF && $2=="pending"')
             bad=$(printf '%s\n' "$runs" | awk -F'\t' 'NF && $3=="completed" && $4!="success" && $4!="skipped" && $4!="neutral"' ; printf '%s\n' "$states" | awk -F'\t' 'NF && ($2=="failure" || $2=="error")')
             if [ -n "$bad" ]; then echo "::error::Nicht grün, keine Freigabe:"; printf '%s\n' "$bad"; exit 1; fi
@@ -60,6 +71,24 @@ jobs:
             sleep 30
           done
           echo "::error::Zeitüberschreitung: Checks nach 70 min nicht fertig"; exit 1
+      - name: Änderungen am Prüf- und Release-Weg brauchen ein Gate-Urteil
+        run: |
+          set -euo pipefail
+          changed=$(gh api "repos/$REPO/pulls/$PR" -q .changed_files)
+          # die Dateiliste der API endet bei 3000 Dateien: darüber gilt der PR als geschützt
+          if [ "$changed" -gt 3000 ]; then geschuetzt="(mehr als 3000 Dateien)"; else
+            geschuetzt=$(gh api "repos/$REPO/pulls/$PR/files?per_page=100" --paginate \
+              -q '.[] | .filename, (.previous_filename // empty)' | grep -E '^\.github/' || true)
+          fi
+          if [ -z "$geschuetzt" ]; then echo "Keine Änderung unter .github/"; exit 0; fi
+          echo "Geschützte Pfade geändert:"; printf '%s\n' "$geschuetzt"
+          if gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
+               -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body' \
+             | tr -d '\r' | grep -qE "^Gate-Urteil: GO $SHA([^0-9a-f]|$)"; then
+            echo "Gate-Urteil GO am Head $SHA liegt vor"; exit 0
+          fi
+          echo "::error::Änderung am Prüf-/Release-Weg (.github/): Freigabe erst mit der Kommentarzeile 'Gate-Urteil: GO $SHA' einer Instanz, die nicht gebaut hat. Der Kommentar stößt die Freigabe von selbst neu an."
+          exit 1
       - name: Freigeben, wenn der Head unverändert ist
         run: |
           set -euo pipefail
