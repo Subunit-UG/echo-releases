@@ -13,10 +13,11 @@
 # - Der Check-Run "Volle Testsuite" muss am exakten Head existieren und grün sein.
 # - Nur PRs aus diesem Repo (Schreibrecht nötig), nie aus Forks; keine Entwürfe.
 # - "Volle Testsuite" und "Automatische Freigabe" sind Pflicht-Checks auf main.
-# - Ändert ein PR etwas unter .github/ (Prüf- und Release-Weg selbst, Zugriff auf
-#   Signier-Geheimnisse), definiert er sein Grün selbst. Dann gibt es die Freigabe erst mit
+# - Ändert ein PR etwas unter .github/ oder scripts/ (Prüf- und Release-Weg selbst: was als
+#   grün gilt und was mit Signier-Geheimnissen läuft), definiert er sein Grün selbst. Dann gibt es die Freigabe erst mit
 #   dem Gate-Urteil einer zweiten Instanz am exakten Head (Canon Release-Gate): eine
-#   Kommentarzeile "Gate-Urteil: GO <voller Head-SHA>". Prozess-Mauer gegen stilles
+#   Kommentarzeile "Gate-Urteil: GO <voller Head-SHA>". Ein späteres NO-GO am selben Head hebt
+#   ein früheres GO auf. Prozess-Mauer gegen stilles
 #   Aufweichen durch Agenten, kein Schutz gegen böswillige Schreibrechte (gleiche Identität).
 # - Neue Testläufe und Gate-Urteile stoßen eine fehlgeschlagene Freigabe von selbst neu an
 #   (auto-freigabe-nachlauf.yml); niemand muss von Hand neu starten.
@@ -55,12 +56,13 @@ jobs:
           set -euo pipefail
           for _ in $(seq 1 140); do
             # der eigene Job (auch aus früheren Läufen am selben Head) zählt nicht mit
-            # abgebrochene Läufe zählen nicht, wenn es danach einen neueren gleichnamigen gibt
-            # (Abbruch durch cancel-in-progress); ein roter Lauf wird nie ausgeblendet
-            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100&filter=all" --paginate \
-              -q '.check_runs[] | select(.name != "Automatische Freigabe") | [.id, .name, .status, (.conclusion // "-")] | @tsv' \
-              | awk -F'\t' 'NF{row[NR]=$0; id[NR]=$1; nm[NR]=$2; c[NR]=$4; if($1>max[$2]) max[$2]=$1}
-                  END{for(i in row) if(!(c[i]=="cancelled" && id[i]<max[nm[i]])) print row[i]}')
+            # Standardfilter "latest": je Suite nur der letzte Versuch (ein Neustart ersetzt den roten).
+            # Über Suiten hinweg zählt ein abgebrochener Lauf nicht, wenn danach ein neuerer
+            # gleichnamiger derselben App kam (cancel-in-progress); ein roter wird nie ausgeblendet.
+            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
+              -q '.check_runs[] | select(.name != "Automatische Freigabe") | [.id, .name, .status, (.conclusion // "-"), .app.id] | @tsv' \
+              | awk -F'\t' 'NF{k=$2 SUBSEP $5; row[NR]=$1 FS $2 FS $3 FS $4; id[NR]=$1; key[NR]=k; c[NR]=$4; if($1>max[k]) max[k]=$1}
+                  END{for(i in row) if(!(c[i]=="cancelled" && id[i]<max[key[i]])) print row[i]}')
             # die volle Testsuite ist Pflicht: fehlt ihr Check-Run noch, weiter warten
             if ! printf '%s\n' "$runs" | awk -F'\t' '$2=="Volle Testsuite"{f=1} END{exit !f}'; then sleep 30; continue; fi
             states=$(gh api "repos/$REPO/commits/$SHA/status?per_page=100" --paginate -q '.statuses[] | [.context, .state] | @tsv')
@@ -71,23 +73,23 @@ jobs:
             sleep 30
           done
           echo "::error::Zeitüberschreitung: Checks nach 70 min nicht fertig"; exit 1
-      - name: Änderungen am Prüf- und Release-Weg brauchen ein Gate-Urteil
+      - name: Änderungen am Prüf- und Release-Weg (.github/, scripts/) brauchen ein Gate-Urteil
         run: |
           set -euo pipefail
           changed=$(gh api "repos/$REPO/pulls/$PR" -q .changed_files)
           # die Dateiliste der API endet bei 3000 Dateien: darüber gilt der PR als geschützt
           if [ "$changed" -gt 3000 ]; then geschuetzt="(mehr als 3000 Dateien)"; else
             geschuetzt=$(gh api "repos/$REPO/pulls/$PR/files?per_page=100" --paginate \
-              -q '.[] | .filename, (.previous_filename // empty)' | grep -E '^\.github/' || true)
+              -q '.[] | .filename, (.previous_filename // empty)' | grep -E '^(\.github|scripts)/' || true)
           fi
-          if [ -z "$geschuetzt" ]; then echo "Keine Änderung unter .github/"; exit 0; fi
+          if [ -z "$geschuetzt" ]; then echo "Keine Änderung unter .github/ oder scripts/"; exit 0; fi
           echo "Geschützte Pfade geändert:"; printf '%s\n' "$geschuetzt"
           if gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
                -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body' \
-             | tr -d '\r' | grep -qE "^Gate-Urteil: GO $SHA([^0-9a-f]|$)"; then
+             | tr -d '\r' | grep -E "^Gate-Urteil: (GO|NO-GO) $SHA([^0-9a-f]|$)" | tail -n 1 | grep -q '^Gate-Urteil: GO '; then
             echo "Gate-Urteil GO am Head $SHA liegt vor"; exit 0
           fi
-          echo "::error::Änderung am Prüf-/Release-Weg (.github/): Freigabe erst mit der Kommentarzeile 'Gate-Urteil: GO $SHA' einer Instanz, die nicht gebaut hat. Der Kommentar stößt die Freigabe von selbst neu an."
+          echo "::error::Änderung am Prüf-/Release-Weg (.github/, scripts/): Freigabe erst mit der Kommentarzeile 'Gate-Urteil: GO $SHA' einer Instanz, die nicht gebaut hat. Der Kommentar stößt die Freigabe von selbst neu an."
           exit 1
       - name: Freigeben, wenn der Head unverändert ist
         run: |

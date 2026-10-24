@@ -5,6 +5,10 @@
 #   wackligen Tests), oder
 # - sobald ein Gate-Urteil ("Gate-Urteil: GO <Head-SHA>") als Kommentar eingeht.
 #
+# Ein Neustart nutzt die Workflow-Definition des ursprünglichen Laufs. Deshalb startet der
+# Nachlauf nur Läufe neu, die NACH der letzten Änderung an auto-freigabe.yml auf main begonnen
+# haben; ältere Läufe könnten eine überholte, schwächere Prüfung wiederholen (Gate 2026-10-24).
+#
 # SICHERHEIT: Läuft aus main (workflow_run / issue_comment), checkt keinen Code aus, liest
 # keine Kommentartexte in Befehle ein und darf nur Läufe neu starten (actions: write).
 # Kommentare zählen nur von OWNER/MEMBER/COLLABORATOR, nie von Fremden im öffentlichen Repo.
@@ -55,9 +59,15 @@ jobs:
           # ein Testlauf an einem älteren Head zählt nicht
           if [ "$EREIGNIS" = "workflow_run" ] && [ "$RUN_SHA" != "$head" ]; then echo "Testlauf nicht am aktuellen Head"; exit 0; fi
           letzter=$(gh api "repos/$REPO/actions/workflows/auto-freigabe.yml/runs?head_sha=$head&event=pull_request_target&per_page=100" \
-            -q '.workflow_runs | sort_by(.id) | last | select(. != null) | [.id, .status, (.conclusion // "-")] | @tsv')
+            -q '.workflow_runs | sort_by(.id) | last | select(. != null) | [.id, .status, (.conclusion // "-"), .created_at] | @tsv')
           if [ -z "$letzter" ]; then echo "Noch keine Freigabe am Head $head"; exit 0; fi
-          read -r id status conclusion <<<"$letzter"
+          read -r id status conclusion erstellt <<<"$letzter"
+          definition=$(gh api "repos/$REPO/commits?sha=main&path=.github/workflows/auto-freigabe.yml&per_page=1" -q '.[0].commit.committer.date')
+          # ISO-8601 in UTC ist lexikografisch vergleichbar
+          if [[ "$erstellt" < "$definition" ]]; then
+            echo "::warning::Freigabe-Lauf $id ($erstellt) stammt von einer älteren Definition ($definition); Neustart würde die alte Prüfung wiederholen. Neu pushen oder PR schließen und wieder öffnen."
+            exit 0
+          fi
           case "$status/$conclusion" in
             completed/failure|completed/cancelled|completed/timed_out)
               gh api -X POST "repos/$REPO/actions/runs/$id/rerun" >/dev/null
