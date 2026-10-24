@@ -1,0 +1,89 @@
+# Automatische Freigabe: grüne PRs blockieren nie (TJ 2026-10-24).
+#
+# main verlangt eine Freigabe einer anderen Identität (Branch-Schutz seit 2026-10-23).
+# Diese Freigabe gibt github-actions[bot], sobald die volle Testsuite und ALLE übrigen
+# Checks am exakten Head grün sind. Keine Rückfrage, kein Klick.
+#
+# SICHERHEIT:
+# - pull_request_target: Workflow-Definition kommt immer aus main, ein PR kann die
+#   Freigabe-Logik für sich selbst nicht umschreiben.
+# - PR-Code läuft nur im Job "pruefen" mit reinem Lesetoken, ohne Secrets, ohne Cache.
+# - Der Freigabe-Job checkt keinen PR-Code aus und führt keinen aus.
+# - Nur PRs aus diesem Repo (Schreibrecht nötig), nie aus Forks; keine Entwürfe.
+
+name: Automatische Freigabe
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: auto-freigabe-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pruefen:
+    name: Volle Testsuite
+    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, immutable
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Minisign für Signatur-Tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+      - name: Alle Tests
+        run: python -m unittest discover -s tests -v
+
+  freigeben:
+    name: Automatische Freigabe
+    needs: pruefen
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      pull-requests: write
+      checks: read
+      statuses: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Auf alle übrigen Checks am exakten Head warten
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 140); do
+            # eigene Jobs (gleicher Name, auch aus früheren Läufen am selben Head) zählen nicht
+            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
+              -q '.check_runs[] | select(.name != "Volle Testsuite" and .name != "Automatische Freigabe") | [.id, .name, .status, (.conclusion // "-")] | @tsv')
+            states=$(gh api "repos/$REPO/commits/$SHA/status" -q '.statuses[] | [.context, .state] | @tsv')
+            pending=$(printf '%s\n' "$runs" | awk -F'\t' 'NF && $3!="completed"' ; printf '%s\n' "$states" | awk -F'\t' 'NF && $2=="pending"')
+            bad=$(printf '%s\n' "$runs" | awk -F'\t' 'NF && $3=="completed" && $4!="success" && $4!="skipped" && $4!="neutral"' ; printf '%s\n' "$states" | awk -F'\t' 'NF && ($2=="failure" || $2=="error")')
+            if [ -n "$bad" ]; then echo "::error::Nicht grün, keine Freigabe:"; printf '%s\n' "$bad"; exit 1; fi
+            if [ -z "$pending" ]; then echo "Alle übrigen Checks grün:"; printf '%s\n' "$runs" | cut -f2,4; exit 0; fi
+            sleep 30
+          done
+          echo "::error::Zeitüberschreitung: Checks nach 70 min nicht fertig"; exit 1
+      - name: Freigeben, wenn der Head unverändert ist
+        run: |
+          set -euo pipefail
+          read -r state head draft < <(gh api "repos/$REPO/pulls/$PR" -q '[.state, .head.sha, .draft] | @tsv')
+          if [ "$state" != "open" ] || [ "$head" != "$SHA" ] || [ "$draft" != "false" ]; then
+            echo "::notice::PR geändert (state=$state head=$head draft=$draft), keine Freigabe für $SHA"; exit 0
+          fi
+          gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f commit_id="$SHA" -f event=APPROVE \
+            -f body="Automatische Freigabe: volle Testsuite und alle übrigen Checks grün am Head \`$SHA\`." >/dev/null
+          echo "Freigegeben: PR #$PR am $SHA"
