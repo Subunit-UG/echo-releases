@@ -3,7 +3,11 @@
 # Stößt eine fehlgeschlagene oder abgebrochene "Automatische Freigabe" am aktuellen Head neu an,
 # - sobald die Freigabe-Tests dort grün durchgelaufen sind (z. B. nach einem Neustart eines
 #   wackligen Tests), oder
-# - sobald ein Gate-Urteil ("Gate-Urteil: GO <Head-SHA>") als Kommentar eingeht.
+# - sobald ein Gate-Urteil ("Gate-Urteil: GO <Head-SHA>") als Kommentar eingeht; fehlt am Head
+#   dann noch die Bot-Freigabe (z. B. nach einem zurückgenommenen NO-GO), auch nach grünem Lauf.
+#
+# Ein späteres "Gate-Urteil: NO-GO <Head-SHA>" zieht eine bereits erteilte Bot-Freigabe am
+# Head zurück (Job nogo-zuruecknehmen), damit ein NO-GO nicht nur künftige Läufe sperrt.
 #
 # Ein Neustart nutzt die Workflow-Definition des ursprünglichen Laufs. Deshalb startet der
 # Nachlauf nur Läufe neu, die NACH der letzten Änderung an auto-freigabe.yml auf main begonnen
@@ -72,5 +76,50 @@ jobs:
             completed/failure|completed/cancelled|completed/timed_out)
               gh api -X POST "repos/$REPO/actions/runs/$id/rerun" >/dev/null
               echo "Freigabe-Lauf $id ($conclusion) am Head $head neu gestartet" ;;
+            completed/success)
+              # nach einem Gate-Urteil GO: fehlt die Bot-Freigabe am Head (etwa nach NO-GO), neu starten
+              freigaben=$(gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" --paginate \
+                -q "[.[] | select(.user.login == \"github-actions[bot]\" and .state == \"APPROVED\" and .commit_id == \"$head\")] | length" \
+                | awk '{s+=$1} END{print s+0}')
+              if [ "$EREIGNIS" = "issue_comment" ] && [ "$freigaben" -eq 0 ]; then
+                gh api -X POST "repos/$REPO/actions/runs/$id/rerun" >/dev/null
+                echo "Freigabe-Lauf $id grün, aber keine Bot-Freigabe am Head $head: neu gestartet"
+              else echo "Freigabe-Lauf $id grün, Freigaben am Head: $freigaben"; fi ;;
             *) echo "Freigabe-Lauf $id ist $status/$conclusion, nichts zu tun" ;;
           esac
+
+  nogo-zuruecknehmen:
+    name: Freigabe nach NO-GO zurücknehmen
+    if: >-
+      github.event_name == 'issue_comment'
+      && github.event.issue.pull_request
+      && contains(github.event.comment.body, 'Gate-Urteil: NO-GO')
+      && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.issue.number }}
+    steps:
+      - name: Bot-Freigabe zurückziehen, wenn das letzte Urteil am Head NO-GO ist
+        run: |
+          set -euo pipefail
+          head=$(gh api "repos/$REPO/pulls/$PR" -q .head.sha)
+          # gleiche Regel wie in auto-freigabe.yml: das letzte Urteil am exakten Head gilt
+          letztes=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
+              -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body' \
+            | tr -d '\r' | grep -E "^Gate-Urteil: (GO|NO-GO) $head([^0-9a-f]|$)" | tail -n 1 || true)
+          case "$letztes" in
+            "Gate-Urteil: NO-GO "*) ;;
+            *) echo "Letztes Urteil am Head $head ist kein NO-GO, nichts zu tun"; exit 0 ;;
+          esac
+          ids=$(gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" --paginate \
+            -q '.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED") | .id')
+          for id in $ids; do
+            gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$id/dismissals" \
+              -f message="Gate-Urteil NO-GO am Head $head: automatische Freigabe zurückgezogen." -f event=DISMISS >/dev/null
+            echo "Bot-Freigabe $id zurückgezogen"
+          done
