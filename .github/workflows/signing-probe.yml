@@ -1,0 +1,123 @@
+name: Signing tools probe (no credentials)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Signing tools / ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # Deliberately no checkout, Azure login, signing input, secrets or OIDC permission.
+      # Both upstream CLIs ship x64 executables; ARM tests x64 emulation explicitly.
+      - name: artifact-signing-cli 0.12.0 startup
+        id: artifact
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = Join-Path $env:RUNNER_TEMP 'artifact-signing-cli.exe'
+          Invoke-WebRequest 'https://github.com/Levminer/artifact-signing-cli/releases/download/0.12.0/artifact-signing-cli.exe' -OutFile $path
+          if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'dd6fa95a0367cbd32ea520037c3df72d1ed8f523a5b07883b0c2a4034e918a53') { throw 'artifact-signing-cli checksum mismatch' }
+          & $path --version
+          if ($LASTEXITCODE -ne 0) { throw 'artifact-signing-cli --version failed' }
+          & $path --help
+          if ($LASTEXITCODE -ne 0) { throw 'artifact-signing-cli --help failed' }
+          Write-Output 'PROBE artifact-signing-cli PASS (x64 executable, no authentication)'
+
+      - name: relic 8.2.0 startup
+        id: relic
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = Join-Path $env:RUNNER_TEMP 'relic.exe'
+          Invoke-WebRequest 'https://github.com/sassoftware/relic/releases/download/v8.2.0/relic-windows-amd64.exe' -OutFile $path
+          if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne '1411ca46a792483f200b744df9fba20bb32179d831f77264d8157f0f445a6082') { throw 'relic checksum mismatch' }
+          & $path --version
+          if ($LASTEXITCODE -ne 0) { throw 'relic --version failed' }
+          & $path --help
+          if ($LASTEXITCODE -ne 0) { throw 'relic --help failed' }
+          Write-Output 'PROBE relic PASS (x64 executable, no authentication)'
+
+      - name: SignTool startup and Microsoft dlib load (x64 .NET host)
+        id: dlib
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $signtool = Get-ChildItem $kits -Filter signtool.exe -File -Recurse |
+            Where-Object { $_.Directory.Name -eq 'x64' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'x64 SignTool missing' }
+          # SignTool returns nonzero for /? on some SDKs; require its usage text.
+          $help = (& $signtool.FullName /? 2>&1 | Out-String)
+          $global:LASTEXITCODE = 0
+          if ($help -notmatch 'SignTool') { throw 'SignTool did not print help' }
+          Write-Output 'PROBE signtool PASS (x64 executable, help only)'
+
+          $probe = Join-Path $env:RUNNER_TEMP 'dlib-probe'
+          New-Item -ItemType Directory -Path $probe | Out-Null
+          $package = Join-Path $probe 'client.zip'
+          Invoke-WebRequest 'https://www.nuget.org/api/v2/package/Microsoft.ArtifactSigning.Client/1.0.146' -OutFile $package
+          Expand-Archive $package -DestinationPath (Join-Path $probe 'client')
+          $dlib = Join-Path $probe 'client/bin/x64/Azure.CodeSigning.Dlib.dll'
+          if (-not (Test-Path -LiteralPath $dlib)) { throw 'x64 dlib missing in package' }
+
+          # A native ARM PowerShell cannot load an x64 DLL. Use an explicit x64
+          # .NET SDK/host to test the same architecture as SignTool + the dlib.
+          $installer = Join-Path $probe 'dotnet-install.ps1'
+          Invoke-WebRequest 'https://raw.githubusercontent.com/dotnet/install-scripts/e5cf1dd2d1540ed05ac84f8eb8c5cdec2807621e/src/dotnet-install.ps1' -OutFile $installer
+          $sdk = Join-Path $probe 'dotnet-x64'
+          & $installer -Version '8.0.408' -Architecture x64 -InstallDir $sdk -NoPath
+          $dotnet = Join-Path $sdk 'dotnet.exe'
+          if (-not (Test-Path -LiteralPath $dotnet)) { throw 'x64 .NET installation failed' }
+          @'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0</TargetFramework>
+              <PlatformTarget>x64</PlatformTarget>
+            </PropertyGroup>
+          </Project>
+          '@ | Set-Content (Join-Path $probe 'DlibProbe.csproj')
+          @'
+          using System;
+          using System.Runtime.InteropServices;
+          if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+              throw new Exception("Probe must run in an x64 process");
+          var library = NativeLibrary.Load(args[0]);
+          if (!NativeLibrary.TryGetExport(library, "AuthenticodeDigestSign", out _))
+              throw new Exception("AuthenticodeDigestSign export missing");
+          NativeLibrary.Free(library);
+          Console.WriteLine("PROBE dlib-load PASS (x64 host + AuthenticodeDigestSign export; never invoked)");
+          '@ | Set-Content (Join-Path $probe 'Program.cs')
+          & $dotnet build (Join-Path $probe 'DlibProbe.csproj') --configuration Release --output (Join-Path $probe 'out')
+          if ($LASTEXITCODE -ne 0) { throw 'dlib probe compilation failed' }
+          & $dotnet (Join-Path $probe 'out/DlibProbe.dll') $dlib
+          if ($LASTEXITCODE -ne 0) { throw 'x64 dlib load/export probe failed' }
+
+      - name: Summarize startup results
+        if: always()
+        env:
+          ARTIFACT_RESULT: ${{ steps.artifact.outcome }}
+          RELIC_RESULT: ${{ steps.relic.outcome }}
+          DLIB_RESULT: ${{ steps.dlib.outcome }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          $line = "PROBE SUMMARY $env:RUNNER_LABEL artifact-signing-cli=$env:ARTIFACT_RESULT relic=$env:RELIC_RESULT signtool+dlib=$env:DLIB_RESULT"
+          Write-Output $line
+          $line >> $env:GITHUB_STEP_SUMMARY
+          'Startup and native loading only. OIDC, access rights, signing, timestamps and packaging remain unverified.' >> $env:GITHUB_STEP_SUMMARY
+          if (@($env:ARTIFACT_RESULT, $env:RELIC_RESULT, $env:DLIB_RESULT) | Where-Object { $_ -ne 'success' }) {
+            throw 'At least one signing tool probe failed; inspect the independent step results'
+          }
