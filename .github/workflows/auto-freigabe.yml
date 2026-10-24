@@ -79,8 +79,10 @@ jobs:
           changed=$(gh api "repos/$REPO/pulls/$PR" -q .changed_files)
           # die Dateiliste der API endet bei 3000 Dateien: darüber gilt der PR als geschützt
           if [ "$changed" -gt 3000 ]; then geschuetzt="(mehr als 3000 Dateien)"; else
-            geschuetzt=$(gh api "repos/$REPO/pulls/$PR/files?per_page=100" --paginate \
-              -q '.[] | .filename, (.previous_filename // empty)' | grep -E '^(\.github|scripts)/' || true)
+            # Abruf allein: ein API-Fehler bricht ab, statt den PR als ungeschützt zu werten
+            dateien=$(gh api "repos/$REPO/pulls/$PR/files?per_page=100" --paginate \
+              -q '.[] | .filename, (.previous_filename // empty)')
+            geschuetzt=$(printf '%s\n' "$dateien" | { grep -E '^(\.github|scripts)/' || true; })
           fi
           if [ -z "$geschuetzt" ]; then echo "Keine Änderung unter .github/ oder scripts/"; exit 0; fi
           echo "Geschützte Pfade geändert:"; printf '%s\n' "$geschuetzt"
@@ -99,12 +101,23 @@ jobs:
             echo "::notice::PR geändert (state=$state head=$head draft=$draft), keine Freigabe für $SHA"; exit 0
           fi
           # ein NO-GO als letztes Urteil am Head sperrt jeden PR, unmittelbar vor dem Freigeben geprüft
-          letztes=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
-              -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body' \
-            | tr -d '\r' | grep -E "^Gate-Urteil: (GO|NO-GO) $SHA([^0-9a-f]|$)" | tail -n 1 || true)
+          # Abruf allein: ein API-Fehler bricht den Schritt ab (fail-closed), nur "kein Treffer" ist ok
+          urteile=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
+            -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body')
+          letztes=$(printf '%s\n' "$urteile" | tr -d '\r' | { grep -E "^Gate-Urteil: (GO|NO-GO) $SHA([^0-9a-f]|$)" || true; } | tail -n 1)
           case "$letztes" in
             "Gate-Urteil: NO-GO "*) echo "::error::Letztes Gate-Urteil am Head $SHA ist NO-GO, keine Freigabe"; exit 1 ;;
           esac
           gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f commit_id="$SHA" -f event=APPROVE \
-            -f body="Automatische Freigabe: volle Testsuite und alle übrigen Checks grün am Head \`$SHA\`." >/dev/null
+            -f body="Automatische Freigabe: volle Testsuite und alle übrigen Checks grün am Head \`$SHA\`." -q .id > review-id
+          # Nachkontrolle: kam währenddessen ein NO-GO, nimmt sich die Freigabe selbst zurück
+          urteile=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
+            -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body')
+          letztes=$(printf '%s\n' "$urteile" | tr -d '\r' | { grep -E "^Gate-Urteil: (GO|NO-GO) $SHA([^0-9a-f]|$)" || true; } | tail -n 1)
+          case "$letztes" in
+            "Gate-Urteil: NO-GO "*)
+              gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$(cat review-id)/dismissals" \
+                -f message="Gate-Urteil NO-GO am Head $SHA: automatische Freigabe zurückgezogen." -f event=DISMISS >/dev/null
+              echo "::error::NO-GO während der Freigabe eingegangen, Freigabe zurückgezogen"; exit 1 ;;
+          esac
           echo "Freigegeben: PR #$PR am $SHA"
