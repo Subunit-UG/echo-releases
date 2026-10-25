@@ -1,0 +1,125 @@
+name: Signing tools probe (no credentials)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/signing-probe.yml'
+      - 'scripts/sign-windows.ps1'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Signing tools / ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, immutable
+        with:
+          persist-credentials: false
+
+      # No secrets, Azure login or OIDC permission. Both tools run as x64 processes.
+      - name: SignTool and Microsoft dlib reach authentication (no credentials)
+        id: dlib
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $signing = Join-Path $env:RUNNER_TEMP 'windows-signing-probe'
+          New-Item -ItemType Directory -Path $signing | Out-Null
+          # Keep the complete package: the native dlib needs its adjacent assemblies.
+          $package = Join-Path $signing 'client.zip'
+          Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.artifactsigning.client/1.0.146/microsoft.artifactsigning.client.1.0.146.nupkg' -OutFile $package
+          if ((Get-FileHash $package -Algorithm SHA256).Hash.ToLowerInvariant() -ne '7761e5d8f31e54b764da21d33cd8b0a2940e1b05526c7dfcb5e94b0431426f70') { throw 'Artifact Signing client checksum mismatch' }
+          Expand-Archive $package -DestinationPath (Join-Path $signing 'client')
+          $dlib = Join-Path $signing 'client/bin/x64/Azure.CodeSigning.Dlib.dll'
+          if (-not (Test-Path -LiteralPath $dlib)) { throw 'x64 Artifact Signing dlib missing' }
+          $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+          $signtool = Get-ChildItem $kits -Filter signtool.exe -File -Recurse |
+            Where-Object { $_.Directory.Name -eq 'x64' -and [version]$_.Directory.Parent.Name -ge [version]'10.0.22621.755' } |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'Compatible x64 SignTool missing' }
+          # An x64 runtime is needed even when PowerShell and the runner are ARM64.
+          $runtime = Join-Path $signing 'dotnet.zip'
+          Invoke-WebRequest 'https://builds.dotnet.microsoft.com/dotnet/Runtime/8.0.32/dotnet-runtime-8.0.32-win-x64.zip' -OutFile $runtime
+          if ((Get-FileHash $runtime -Algorithm SHA512).Hash.ToLowerInvariant() -ne 'f0349e793d8081c682c01d736db695c9c1ec268c6173648913543db219e44cbf2e952c7ef94fc37946b0f2bb95ca1898d972a43591b8e44d5a1659f4911904c0') { throw '.NET runtime checksum mismatch' }
+          $dotnet = Join-Path $signing 'dotnet-x64'
+          Expand-Archive $runtime -DestinationPath $dotnet
+          $env:DOTNET_ROOT = $dotnet
+          $env:DOTNET_ROOT_X64 = $dotnet
+          $env:SIGNTOOL_PATH = $signtool.FullName
+          $env:ARTIFACT_SIGNING_DLIB_PATH = $dlib
+          # Match production credentials, but deliberately provide an empty CLI profile.
+          $configPath = Join-Path $signing 'metadata.json'
+          @{
+            Endpoint = 'https://probe.codesigning.azure.net'
+            CodeSigningAccountName = 'credential-free-probe'
+            CertificateProfileName = 'credential-free-probe'
+            ExcludeCredentials = @(
+              'EnvironmentCredential', 'WorkloadIdentityCredential', 'ManagedIdentityCredential',
+              'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential',
+              'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential'
+            )
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM $configPath
+          $env:WINDOWS_SIGNING_BACKEND = 'artifact-signing'
+          $env:WINDOWS_SIGNING_CONFIG = $configPath
+          $env:AZURE_CONFIG_DIR = Join-Path $signing 'empty-azure-profile'
+          New-Item -ItemType Directory -Path $env:AZURE_CONFIG_DIR | Out-Null
+          # A disposable copy, never a release artifact. Authentication must fail
+          # before any signature is written or any signing service is contacted.
+          $dummy = Join-Path $signing 'dummy.exe'
+          Copy-Item (Join-Path $env:WINDIR 'System32/where.exe') $dummy
+          $before = (Get-FileHash $dummy -Algorithm SHA256).Hash
+          $PSNativeCommandUseErrorActionPreference = $false
+          $output = (& pwsh -NoProfile -NonInteractive -File "$env:GITHUB_WORKSPACE/scripts/sign-windows.ps1" $dummy 2>&1 | Out-String)
+          $exitCode = $LASTEXITCODE
+          Write-Output $output
+          if ($exitCode -eq 0) { throw 'Credential-free probe unexpectedly signed a file' }
+          if ($output -match 'Failed to load.*dlib|Failed to load.*Dlib|not a valid Win32|BadImageFormat|0x8007000[Bb]|0x800700[Cc]1') {
+            throw 'dlib failed to load or has the wrong architecture'
+          }
+          if ($output -notmatch 'DefaultAzureCredential failed|CredentialUnavailableException|AuthenticationFailedException|Please run .az login') {
+            throw 'No explicit authentication failure: dlib invocation is not proven'
+          }
+          if ((Get-FileHash $dummy -Algorithm SHA256).Hash -ne $before) { throw 'Probe changed dummy EXE bytes' }
+          # GitHub's PowerShell wrapper propagates LASTEXITCODE after this script.
+          # The expected authentication failure has now been fully checked.
+          $global:LASTEXITCODE = 0
+          Write-Output 'PROBE signtool+dlib PASS (x64; authentication failure reached; dummy EXE unchanged)'
+
+      - name: relic 8.2.0 startup
+        id: relic
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = Join-Path $env:RUNNER_TEMP 'relic.exe'
+          Invoke-WebRequest 'https://github.com/sassoftware/relic/releases/download/v8.2.0/relic-windows-amd64.exe' -OutFile $path
+          if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne '1411ca46a792483f200b744df9fba20bb32179d831f77264d8157f0f445a6082') { throw 'relic checksum mismatch' }
+          & $path --version
+          if ($LASTEXITCODE -ne 0) { throw 'relic --version failed' }
+          & $path --help
+          if ($LASTEXITCODE -ne 0) { throw 'relic --help failed' }
+          Write-Output 'PROBE relic PASS (x64 executable, no authentication)'
+
+      - name: Summarize probe results
+        if: always()
+        env:
+          RELIC_RESULT: ${{ steps.relic.outcome }}
+          DLIB_RESULT: ${{ steps.dlib.outcome }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          $line = "PROBE SUMMARY $env:RUNNER_LABEL relic=$env:RELIC_RESULT signtool+dlib=$env:DLIB_RESULT"
+          Write-Output $line
+          $line >> $env:GITHUB_STEP_SUMMARY
+          'Authentication failure on a dummy EXE only. OIDC, access rights, real signing, timestamps and packaging remain unverified.' >> $env:GITHUB_STEP_SUMMARY
+          if (@($env:RELIC_RESULT, $env:DLIB_RESULT) | Where-Object { $_ -ne 'success' }) {
+            throw 'At least one signing tool probe failed; inspect the independent step results'
+          }
