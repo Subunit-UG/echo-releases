@@ -302,6 +302,18 @@ jobs:
       - name: Validate Windows signing backend
         if: runner.os == 'Windows'
         shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          switch -CaseSensitive ($env:WINDOWS_SIGNING_BACKEND) {
+            'none' { }
+            'artifact-signing' { }
+            'azure-key-vault' { }
+            default { throw 'Unknown WINDOWS_SIGNING_BACKEND' }
+          }
+
+      - name: Validate Windows cloud signing settings
+        if: runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' || vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')
+        shell: pwsh
         env:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -313,7 +325,6 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           switch -CaseSensitive ($env:WINDOWS_SIGNING_BACKEND) {
-            'none' { exit 0 }
             'artifact-signing' { $settings = @('ARTIFACT_SIGNING_ENDPOINT', 'ARTIFACT_SIGNING_ACCOUNT', 'ARTIFACT_SIGNING_CERTIFICATE_PROFILE') }
             'azure-key-vault' { $settings = @('AZURE_KEY_VAULT_CERTIFICATE_URL') }
             default { throw 'Unknown WINDOWS_SIGNING_BACKEND' }
@@ -582,30 +593,45 @@ jobs:
               "RELIC_PATH=$relic" >> $env:GITHUB_ENV
             }
             'artifact-signing' {
-              throw 'artifact-signing-cli 0.12.0 requires a client secret; OIDC implementation decision pending'
+              # Keep the complete package: the native dlib needs its adjacent assemblies.
+              $package = Join-Path $signing 'client.zip'
+              Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.artifactsigning.client/1.0.146/microsoft.artifactsigning.client.1.0.146.nupkg' -OutFile $package
+              if ((Get-FileHash $package -Algorithm SHA256).Hash.ToLowerInvariant() -ne '7761e5d8f31e54b764da21d33cd8b0a2940e1b05526c7dfcb5e94b0431426f70') { throw 'Artifact Signing client checksum mismatch' }
+              Expand-Archive $package -DestinationPath (Join-Path $signing 'client')
+              $dlib = Join-Path $signing 'client/bin/x64/Azure.CodeSigning.Dlib.dll'
+              if (-not (Test-Path -LiteralPath $dlib)) { throw 'x64 Artifact Signing dlib missing' }
+              $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+              $signtool = Get-ChildItem $kits -Filter signtool.exe -File -Recurse |
+                Where-Object { $_.Directory.Name -eq 'x64' -and [version]$_.Directory.Parent.Name -ge [version]'10.0.22621.755' } |
+                Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+              if (-not $signtool) { throw 'Compatible x64 SignTool missing' }
+              # An x64 runtime is needed even when PowerShell and the runner are ARM64.
+              $runtime = Join-Path $signing 'dotnet.zip'
+              Invoke-WebRequest 'https://builds.dotnet.microsoft.com/dotnet/Runtime/8.0.32/dotnet-runtime-8.0.32-win-x64.zip' -OutFile $runtime
+              if ((Get-FileHash $runtime -Algorithm SHA512).Hash.ToLowerInvariant() -ne 'f0349e793d8081c682c01d736db695c9c1ec268c6173648913543db219e44cbf2e952c7ef94fc37946b0f2bb95ca1898d972a43591b8e44d5a1659f4911904c0') { throw '.NET runtime checksum mismatch' }
+              $dotnet = Join-Path $signing 'dotnet-x64'
+              Expand-Archive $runtime -DestinationPath $dotnet
+              "DOTNET_ROOT=$dotnet" >> $env:GITHUB_ENV
+              "DOTNET_ROOT_X64=$dotnet" >> $env:GITHUB_ENV
+              "SIGNTOOL_PATH=$($signtool.FullName)" >> $env:GITHUB_ENV
+              "ARTIFACT_SIGNING_DLIB_PATH=$dlib" >> $env:GITHUB_ENV
+              # Only AzureCliCredential may use the preceding azure/login OIDC session.
+              $configPath = Join-Path $signing 'metadata.json'
+              @{
+                Endpoint = $env:ARTIFACT_SIGNING_ENDPOINT
+                CodeSigningAccountName = $env:ARTIFACT_SIGNING_ACCOUNT
+                CertificateProfileName = $env:ARTIFACT_SIGNING_CERTIFICATE_PROFILE
+                ExcludeCredentials = @(
+                  'EnvironmentCredential', 'WorkloadIdentityCredential', 'ManagedIdentityCredential',
+                  'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential',
+                  'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential'
+                )
+              } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM $configPath
             }
             default { throw 'Unsupported cloud signing backend' }
           }
           "WINDOWS_SIGNING_CONFIG=$configPath" >> $env:GITHUB_ENV
-          $scriptPath = Join-Path $signing 'sign.ps1'
-          @'
-          param([Parameter(Mandatory = $true)][string] $ArtifactPath)
-          $ErrorActionPreference = 'Stop'
-          switch -CaseSensitive ($env:WINDOWS_SIGNING_BACKEND) {
-            'azure-key-vault' {
-              & $env:RELIC_PATH sign --file $ArtifactPath --key azure --config $env:WINDOWS_SIGNING_CONFIG --digest sha256
-            }
-            default { throw 'Unsupported signing backend' }
-          }
-          if ($LASTEXITCODE -ne 0) { throw 'Windows signing command failed' }
-          # Verify each file before Tauri can place it inside an installer or upload it.
-          $signature = Get-AuthenticodeSignature -LiteralPath $ArtifactPath
-          if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or
-              $signature.SignerCertificate.Subject -cne $env:WINDOWS_PUBLISHER -or
-              -not $signature.TimeStamperCertificate) {
-            throw 'Signed file failed Authenticode, publisher or timestamp verification'
-          }
-          '@ | Set-Content -Encoding utf8NoBOM $scriptPath
+          $scriptPath = Join-Path $env:GITHUB_WORKSPACE '_release-ci/scripts/sign-windows.ps1'
           @{
             bundle = @{
               windows = @{

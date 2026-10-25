@@ -33,6 +33,45 @@ UPDATER_VERIFIER = ROOT / "scripts" / "verify-updater-signatures.py"
 ASSET_UPLOADER = ROOT / "scripts" / "upload-release-asset.py"
 
 
+def azure_signing_scope_errors(workflow: str) -> list[str]:
+    """Azure access belongs to opt-in steps; OIDC permissions are job-scoped."""
+    errors: list[str] = []
+    backend_condition = (
+        "runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' "
+        "|| vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')"
+    )
+    azure_reference = re.compile("azure", re.IGNORECASE)
+    token_write = re.compile(r"id-token:\s*write", re.IGNORECASE)
+    header, jobs = workflow.split("\njobs:\n", 1)
+    if azure_reference.search(header) or token_write.search(header):
+        errors.append("Azure/OIDC access is forbidden at workflow level")
+    for job in re.finditer(r"(?ms)^  ([A-Za-z0-9_-]+):\n.*?(?=^  [A-Za-z0-9_-]+:\n|\Z)", jobs):
+        name, block = job.group(1), job.group(0)
+        steps = list(re.finditer(r"(?ms)^      - .*?(?=^      - |\Z)", block))
+        for step in steps:
+            text = step.group(0)
+            # The backend enum itself grants no Azure access.
+            if azure_reference.search(text.replace("azure-key-vault", "")):
+                condition = re.search(r"^        if: (.+)$", text, re.MULTILINE)
+                if condition is None or condition.group(1) != backend_condition:
+                    errors.append(f"{name}: Azure step requires the explicit Windows backend condition")
+            if token_write.search(text):
+                errors.append(f"{name}: id-token permission must be at job level")
+        outside_steps = re.sub(r"(?ms)^      - .*?(?=^      - |\Z)", "", block)
+        if name == "build":
+            # GitHub has no step-level permissions. This matrix job signs Windows
+            # during Tauri bundling; other matrix rows never run Azure actions.
+            if not any("uses: azure/login@" in step.group(0) for step in steps):
+                errors.append("build: OIDC requires a Windows signing login step")
+            permissions = re.search(r"(?m)^    permissions:\n(?:^      [^\n]*\n)*", outside_steps)
+            if permissions is not None:
+                restricted = re.sub(r"(?m)^      id-token: write[^\n]*\n", "", permissions.group(0))
+                outside_steps = outside_steps.replace(permissions.group(0), restricted, 1)
+        if azure_reference.search(outside_steps) or token_write.search(outside_steps):
+            errors.append(f"{name}: Azure/OIDC access outside the signing scope")
+    return errors
+
+
 def workflow_run_block(after: str) -> str:
     marker_index = WORKFLOW.index(after)
     run_marker = "\n        run: |\n"
@@ -447,7 +486,33 @@ class ReleaseWorkflowContract(unittest.TestCase):
             self.assertIn(f"vars.{variable}", WORKFLOW)
             self.assertIn(f"repository variable {variable} is required for v1+", WORKFLOW)
             self.assertIn(f"`{variable}`", PLATFORM_TRUST_DOC)
-        self.assertNotIn("AZURE", WORKFLOW.upper())
+
+    def test_azure_access_is_limited_to_opt_in_signing_scope(self) -> None:
+        self.assertEqual(azure_signing_scope_errors(WORKFLOW), [])
+
+    def test_azure_scope_rejects_missing_conditions_and_oidc_permission_leaks(self) -> None:
+        build = workflow_job_block("build")
+        cloud_condition = (
+            "        if: runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' "
+            "|| vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')\n"
+        )
+        for step in re.finditer(r"(?ms)^      - .*?(?=^      - |\Z)", build):
+            text = step.group(0)
+            if "azure" not in text.replace("azure-key-vault", "").lower():
+                continue
+            self.assertIn(cloud_condition, text)
+            with self.subTest(step=text.splitlines()[0]):
+                mutant = WORKFLOW.replace(text, text.replace(cloud_condition, "", 1), 1)
+                self.assertTrue(azure_signing_scope_errors(mutant))
+        mutants = {
+            "workflow permission": WORKFLOW.replace("permissions:\n", "permissions:\n  id-token: write\n", 1),
+            "other job permission": WORKFLOW.replace("  prepare:\n", "  prepare:\n    permissions:\n      id-token: write\n", 1),
+            "workflow Azure variable": WORKFLOW.replace("\njobs:\n", "\nenv:\n  AZURE_CLIENT_ID: synthetic\n\njobs:\n", 1),
+        }
+        for label, mutant in mutants.items():
+            with self.subTest(mutation=label):
+                self.assertNotEqual(mutant, WORKFLOW)
+                self.assertTrue(azure_signing_scope_errors(mutant))
 
 
 class ReleasePolicyContract(unittest.TestCase):

@@ -11,7 +11,7 @@ Ohne Auswahlvariable bleibt Echo unsigniert. Die vorhandenen nativen Trust-Gates
 | `WINDOWS_SIGNING_BACKEND` | Verhalten |
 | --- | --- |
 | nicht gesetzt / `none` | Unverändert: keine Authenticode-Konfiguration und kein Azure-Login. Unbekannte Backends brechen ab. |
-| `artifact-signing` | **Noch blockiert:** Einstellungen werden geprüft, dann Azure-OIDC-Anmeldung; die Vorbereitung bricht ausdrücklich ab. Die unveränderte `artifact-signing-cli` 0.12.0 verlangt ein Client-Secret. Ein direkter SignTool/dlib-Weg benötigt die Entscheidung zur Abweichung vom Auftrag. |
+| `artifact-signing` | Azure-OIDC-Anmeldung, x64-SignTool mit Microsoft.ArtifactSigning.Client 1.0.146 und Laufzeit-`metadata.json`; Signieren während des Tauri-Bundlings. |
 | `azure-key-vault` | `relic` 8.2.0 (x64, Download mit festem SHA-256) signiert während des Tauri-Bundlings über den HSM-Schlüssel im Key Vault. |
 
 Cloud-Signierung benutzt eine zur Laufzeit erzeugte Override-Datei
@@ -22,6 +22,17 @@ damit Pfade mit Leerzeichen intakt bleiben. Nach jeder Signatur muss
 Subject** aus `WINDOWS_PUBLISHER` und einen Zeitstempel melden. Eine weitere
 Prüfung erfasst Anwendung und NSIS-Installer nach dem Build. Jeder Fehler stoppt
 den Build und damit die nachfolgenden Veröffentlichungsgates.
+
+Für Artifact Signing ruft das eingecheckte `scripts/sign-windows.ps1` SignTool
+mit `/dlib`, `/dmdf`, `/fd SHA256`, `/tr http://timestamp.acs.microsoft.com`
+und `/td SHA256` auf. Das offizielle NuGet-Paket ist auf 1.0.146 mit SHA-256
+gepinnt, die x64-.NET-Laufzeit auf 8.0.32 mit SHA-512. Auch auf ARM64 werden
+x64-SignTool, x64-dlib und x64-Laufzeit zusammen benutzt. `metadata.json` entsteht
+nur im Job aus den drei `ARTIFACT_SIGNING_*`-Variablen. `ExcludeCredentials`
+schließt Environment-, Workload-/Managed-Identity-, Cache-, IDE-, PowerShell-,
+Developer-CLI- und interaktive Anmeldung aus. Ausschließlich `AzureCliCredential`
+nutzt die vorherige `azure/login`-OIDC-Sitzung; kein Client-Secret erforderlich.
+Die Community-CLI wird nicht verwendet.
 
 Für Key Vault wurde `relic` gewählt: Es unterstützt ausdrücklich
 Azure-CLI-Zugang und Workload Federation; `pin: ""` wählt die von
@@ -84,9 +95,9 @@ Bei ausdrücklich aktivierter Notarisierung wird das Developer-ID-Zertifikat nic
 1. Azure-Federation/Rollen bzw. Developer-ID-Zertifikat und Apple-API-Key außerhalb
    dieses PRs bereitstellen. Obige Variablen/Secrets hinterlegen; es wurden im
    Rahmen dieses Auftrags keine Einstellungen oder Geheimnisse gelesen/gesetzt.
-2. Vor Windows-Aktivierung die zugangsfreie ARM-/x64-Probe auswerten. Der
-   Artifact-Signing-Pfad ist bis zur OIDC-Entscheidung ausdrücklich **nicht bereit**.
-   Ein erfolgreiches `--help` beweist keine funktionsfähige Cloud-Signatur.
+2. Vor Windows-Aktivierung die zugangsfreie ARM-/x64-Probe auswerten.
+   Auch das erfolgreiche Erreichen eines Authentifizierungsfehlers beweist noch
+   keine funktionsfähige Cloud-Signatur mit echtem Konto und OIDC.
 3. Backend bzw. Notarisierungsmethode ausdrücklich auswählen. Später einen
    separat freigegebenen Release-Lauf verwenden und Signaturen, Publisher,
    Zeitstempel, Stapler und die vorhandenen Updater-Gates prüfen.
@@ -96,19 +107,24 @@ Bei ausdrücklich aktivierter Notarisierung wird das Developer-ID-Zertifikat nic
 
 ## Probe und offene Verifikation
 
-[signing-probe.yml](../.github/workflows/signing-probe.yml) prüft `artifact-signing-cli` 0.12.0 und `relic` 8.2.0 jeweils per `--version` und `--help`; außerdem x64-SignTool per Hilfeausgabe und Microsoft.ArtifactSigning.Client 1.0.146 per DLL-Laden/Exportauflösung in einem expliziten x64-.NET-Host. Beide Runner: `windows-latest`, `windows-11-arm`. Kein Credential-Zugriff, kein Azure-Login, keine Signatur und kein Aufruf des Signierexports. CLI-Downloads werden gegen feste SHA-256-Werte geprüft.
+Die separate [Echo-Probe](https://github.com/subunit-ai/echo-releases/blob/feat/signing-ready-20261024/.github/workflows/signing-probe.yml)
+läuft per `pull_request` ausschließlich bei Änderungen an der Probe-Datei oder
+`scripts/sign-windows.ps1`, außerdem manuell per `workflow_dispatch`, sobald
+GitHub den Workflow auf dem Default-Branch registriert hat. Die einzige
+Berechtigung ist `contents: read`; Checkout speichert keine Zugangsdaten.
+Keine Secrets, kein Azure-Login und kein OIDC-Token werden verwendet.
 
-Stand: Die Probe wurde als Dispatch-Workflow auf
-`feat/signing-ready-20261024` hochgeladen. Der Start per
-`gh workflow run signing-probe.yml --ref feat/signing-ready-20261024`
-scheitert mit HTTP 404: `workflow signing-probe.yml not found on the default branch`.
-Es wurde kein Workflow auf main gestartet und nichts gemergt.
-Es gibt **keinen Run-Link und kein Messergebnis**. Beide Runner sowie tatsächliche
-OIDC-Anmeldung, Zertifikatszugriff, Signierung und Notarisierung sind
-**nicht verifiziert**. Die CLI-Quellen belegen unabhängig davon die fehlende
-OIDC-Unterstützung der unveränderten Version 0.12.0.
-Eine einmalige Registrierung über einen eng begrenzten Branch-Trigger ist eine
-angefragte Alternative und noch nicht freigegeben.
+Auf `windows-latest` und `windows-11-arm` lädt sie dieselben gepinnten Pakete
+wie der Build und ruft das eingecheckte Signierskript auf einer wegwerfbaren
+EXE-Kopie auf. Ein leeres Azure-CLI-Profil verhindert Zugangsdatenzugriff.
+Ein expliziter Authentifizierungsfehler bei unveränderten EXE-Bytes ist das
+Erfolgskriterium; DLL-Ladefehler und falsche Architektur schlagen fehl.
+`relic` 8.2.0 wird unabhängig per `--version` und `--help` gestartet.
+Es werden keine Release-Dateien signiert.
+
+Probe-Ergebnis: ausstehend. Tatsächliche OIDC-Anmeldung, Zertifikatszugriff,
+Signierung, Zeitstempel, vollständiges Plattform-Bundling und Apple-Notarisierung
+sind **nicht verifiziert**.
 
 ### Plan B, falls ARM-Werkzeuge nicht starten
 
@@ -133,12 +149,17 @@ Job-Umbau nicht um und verändert weder die Updater- noch die Lockstep-Logik.
 `actionlint` 1.7.12 besteht für Build- und Probe-Workflow mit `-shellcheck=`.
 Der vollständige Build-Lauf meldet unverändert den bereits auf main vorhandenen
 SC2015-Hinweis; der Probe-Workflow besteht auch den vollständigen Lauf.
-Die vorhandene Echo-Suite
-meldet 65 bestandene Tests, drei wegen fehlendem lokalem `minisign` übersprungene
-Tests und einen Konflikt: `tests/test_release_workflow.py:450` verbietet bislang
-`AZURE` im gesamten Build-Workflow. Diese Testdatei ist nicht zum Ändern
-freigegeben und blieb unverändert. Der Konflikt muss vor einem Merge gezielt
-aufgelöst werden. Die Draft-PRs sind daher nicht mergebereit.
+Die vollständige Echo-Suite umfasst 71 Tests: 68 bestanden, drei wegen lokal
+fehlendem `minisign` übersprungen. Der Azure-Vertrag erlaubt Azure-Aktionen und
+-Variablen ausschließlich in Schritten mit der exakten Windows-/Backend-Bedingung.
+`id-token: write` ist ausschließlich auf Job-Ebene im Build-/Signierjob erlaubt;
+GitHub bietet keine Berechtigungen pro Schritt. Workflow-weite Berechtigungen
+und OIDC in anderen Jobs werden abgewiesen. Negative Tests erfassen alle drei
+Azure-Schritte sowie beide OIDC-Regeln und eine globale Azure-Variable.
+Der eigentliche Vertragstest wurde zusätzlich mit drei Änderungen im Speicher
+jeweils rot ausgeführt: Login-Bedingung entfernt, workflow-weites `id-token`
+eingefügt und `id-token` in einem anderen Job eingefügt. Keine Workflow-Datei
+wurde für diese Mutationsprüfung verändert.
 
 Ein zusätzlicher Vergleich bestätigt unveränderte Prepare-, Reserve-, Trust-
 und Publish-Jobs und identische Tauri-Argumente ohne Backend-Auswahl. Ein
@@ -149,7 +170,8 @@ API-Variablen und anschließendes Entfernen; keine echten Zugangsdaten verwendet
 
 - [Tauri: Windows-Signierung und signCommand](https://v2.tauri.app/distribute/sign/windows/)
 - [Tauri: signCommand mit Argument-Array](https://v2.tauri.app/reference/config/#customsigncommandconfig)
-- [artifact-signing-cli 0.12.0: verpflichtendes Secret und eigener Azure-Login](https://github.com/Levminer/artifact-signing-cli/blob/0.12.0/src/main.rs)
+- [Microsoft.ArtifactSigning.Client 1.0.146: dlib und Voraussetzungen](https://www.nuget.org/packages/Microsoft.ArtifactSigning.Client/1.0.146)
+- [.NET 8: offizielle Versionen und Download-Prüfsummen](https://builds.dotnet.microsoft.com/dotnet/release-metadata/8.0/releases.json)
 - [relic 8.2.0: Azure-Authentifizierung](https://github.com/sassoftware/relic/blob/v8.2.0/doc/azure.md)
 - [Azure Login: OIDC](https://github.com/Azure/login/tree/v2#login-with-openid-connect-oidc-recommended)
 - [Microsoft: SignTool, dlib und Authentifizierung](https://learn.microsoft.com/en-us/azure/artifact-signing/how-to-signing-integrations)
