@@ -1,0 +1,37 @@
+# Freigabe-Tests: volle Testsuite bei JEDEM PR auf main, ohne Pfadfilter (TJ 2026-10-24).
+# Läuft unter pull_request (Cache-Bereich des PR-Branches, Lesetoken, keine Secrets).
+# Ihr grüner Check-Run "Volle Testsuite" ist Pflicht-Check auf main und Voraussetzung
+# für die automatische Freigabe (auto-freigabe.yml).
+
+name: Freigabe-Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: freigabe-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pruefen:
+    name: Volle Testsuite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, immutable
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Minisign für Signatur-Tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+      - name: Alle Tests
+        run: python -m unittest discover -s tests -v

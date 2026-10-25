@@ -1,0 +1,123 @@
+# Automatische Freigabe: grüne PRs blockieren nie (TJ 2026-10-24).
+#
+# main verlangt eine Freigabe einer anderen Identität (Branch-Schutz seit 2026-10-23).
+# Diese Freigabe gibt github-actions[bot], sobald die volle Testsuite und ALLE übrigen
+# Checks am exakten Head grün sind. Keine Rückfrage, kein Klick.
+#
+# SICHERHEIT:
+# - pull_request_target: Definition kommt immer aus main; ein PR kann die Freigabe-Logik
+#   für sich selbst nicht umschreiben.
+# - Dieser Workflow checkt KEINEN PR-Code aus und führt keinen aus (sonst Cache-Vergiftung
+#   von main möglich, Gate 2026-10-24). Die Tests laufen getrennt in freigabe-tests.yml
+#   unter pull_request; hier wird nur auf deren Ergebnis gewartet.
+# - Der Check-Run "Volle Testsuite" muss am exakten Head existieren und grün sein.
+# - Nur PRs aus diesem Repo (Schreibrecht nötig), nie aus Forks; keine Entwürfe.
+# - "Volle Testsuite" und "Automatische Freigabe" sind Pflicht-Checks auf main.
+# - Ändert ein PR etwas unter .github/ oder scripts/ (Prüf- und Release-Weg selbst: was als
+#   grün gilt und was mit Signier-Geheimnissen läuft), definiert er sein Grün selbst. Dann gibt es die Freigabe erst mit
+#   dem Gate-Urteil einer zweiten Instanz am exakten Head (Canon Release-Gate): eine
+#   Kommentarzeile "Gate-Urteil: GO <voller Head-SHA>". Ein späteres NO-GO am selben Head hebt
+#   ein früheres GO auf und sperrt jeden PR (auch ohne geschützte Pfade) direkt vor dem Freigeben. Prozess-Mauer gegen stilles
+#   Aufweichen durch Agenten, kein Schutz gegen böswillige Schreibrechte (gleiche Identität).
+# - Neue Testläufe und Gate-Urteile stoßen eine fehlgeschlagene Freigabe von selbst neu an
+#   (auto-freigabe-nachlauf.yml); niemand muss von Hand neu starten.
+
+name: Automatische Freigabe
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: auto-freigabe-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  freigeben:
+    name: Automatische Freigabe
+    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      pull-requests: write
+      checks: read
+      statuses: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Auf volle Testsuite und alle übrigen Checks am exakten Head warten
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 140); do
+            # der eigene Job (auch aus früheren Läufen am selben Head) zählt nicht mit
+            # Standardfilter "latest": je Suite nur der letzte Versuch (ein Neustart ersetzt den roten).
+            # Über Suiten hinweg zählt ein abgebrochener Lauf nicht, wenn danach ein neuerer
+            # gleichnamiger derselben App kam (cancel-in-progress); ein roter wird nie ausgeblendet.
+            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
+              -q '.check_runs[] | select(.name != "Automatische Freigabe") | [.id, .name, .status, (.conclusion // "-"), .app.id] | @tsv' \
+              | awk -F'\t' 'NF{k=$2 SUBSEP $5; row[NR]=$1 FS $2 FS $3 FS $4; id[NR]=$1; key[NR]=k; c[NR]=$4; if($1>max[k]) max[k]=$1}
+                  END{for(i in row) if(!(c[i]=="cancelled" && id[i]<max[key[i]])) print row[i]}')
+            # die volle Testsuite ist Pflicht: fehlt ihr Check-Run noch, weiter warten
+            if ! printf '%s\n' "$runs" | awk -F'\t' '$2=="Volle Testsuite"{f=1} END{exit !f}'; then sleep 30; continue; fi
+            states=$(gh api "repos/$REPO/commits/$SHA/status?per_page=100" --paginate -q '.statuses[] | [.context, .state] | @tsv')
+            pending=$(printf '%s\n' "$runs" | awk -F'\t' 'NF && $3!="completed"' ; printf '%s\n' "$states" | awk -F'\t' 'NF && $2=="pending"')
+            bad=$(printf '%s\n' "$runs" | awk -F'\t' 'NF && $3=="completed" && $4!="success" && $4!="skipped" && $4!="neutral"' ; printf '%s\n' "$states" | awk -F'\t' 'NF && ($2=="failure" || $2=="error")')
+            if [ -n "$bad" ]; then echo "::error::Nicht grün, keine Freigabe:"; printf '%s\n' "$bad"; exit 1; fi
+            if [ -z "$pending" ]; then echo "Volle Testsuite und alle übrigen Checks grün:"; printf '%s\n' "$runs" | cut -f2,4; exit 0; fi
+            sleep 30
+          done
+          echo "::error::Zeitüberschreitung: Checks nach 70 min nicht fertig"; exit 1
+      - name: Änderungen am Prüf- und Release-Weg (.github/, scripts/) brauchen ein Gate-Urteil
+        run: |
+          set -euo pipefail
+          changed=$(gh api "repos/$REPO/pulls/$PR" -q .changed_files)
+          # die Dateiliste der API endet bei 3000 Dateien: darüber gilt der PR als geschützt
+          if [ "$changed" -gt 3000 ]; then geschuetzt="(mehr als 3000 Dateien)"; else
+            # Abruf allein: ein API-Fehler bricht ab, statt den PR als ungeschützt zu werten
+            dateien=$(gh api "repos/$REPO/pulls/$PR/files?per_page=100" --paginate \
+              -q '.[] | .filename, (.previous_filename // empty)')
+            geschuetzt=$(printf '%s\n' "$dateien" | { grep -E '^(\.github|scripts)/' || true; })
+          fi
+          if [ -z "$geschuetzt" ]; then echo "Keine Änderung unter .github/ oder scripts/"; exit 0; fi
+          echo "Geschützte Pfade geändert:"; printf '%s\n' "$geschuetzt"
+          if gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
+               -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | (.body // "") | gsub("\r"; "") | split("\n") | map(select(test("^Gate-Urteil: (GO|NO-GO) "))) | .[0] // empty' \
+             | tr -d '\r' | grep -E "^Gate-Urteil: (GO|NO-GO) $SHA([^0-9a-f]|$)" | tail -n 1 | grep -q '^Gate-Urteil: GO '; then
+            echo "Gate-Urteil GO am Head $SHA liegt vor"; exit 0
+          fi
+          echo "::error::Änderung am Prüf-/Release-Weg (.github/, scripts/): Freigabe erst mit der Kommentarzeile 'Gate-Urteil: GO $SHA' einer Instanz, die nicht gebaut hat. Der Kommentar stößt die Freigabe von selbst neu an."
+          exit 1
+      - name: Freigeben, wenn der Head unverändert ist
+        run: |
+          set -euo pipefail
+          read -r state head draft < <(gh api "repos/$REPO/pulls/$PR" -q '[.state, .head.sha, .draft] | @tsv')
+          if [ "$state" != "open" ] || [ "$head" != "$SHA" ] || [ "$draft" != "false" ]; then
+            echo "::notice::PR geändert (state=$state head=$head draft=$draft), keine Freigabe für $SHA"; exit 0
+          fi
+          # ein NO-GO als letztes Urteil am Head sperrt jeden PR, unmittelbar vor dem Freigeben geprüft
+          # Abruf allein: ein API-Fehler bricht den Schritt ab (fail-closed), nur "kein Treffer" ist ok
+          urteile=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
+            -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | (.body // "") | gsub("\r"; "") | split("\n") | map(select(test("^Gate-Urteil: (GO|NO-GO) "))) | .[0] // empty')
+          letztes=$(printf '%s\n' "$urteile" | tr -d '\r' | { grep -E "^Gate-Urteil: (GO|NO-GO) $SHA([^0-9a-f]|$)" || true; } | tail -n 1)
+          case "$letztes" in
+            "Gate-Urteil: NO-GO "*) echo "::error::Letztes Gate-Urteil am Head $SHA ist NO-GO, keine Freigabe"; exit 1 ;;
+          esac
+          gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f commit_id="$SHA" -f event=APPROVE \
+            -f body="Automatische Freigabe: volle Testsuite und alle übrigen Checks grün am Head \`$SHA\`." -q .id > review-id
+          # Nachkontrolle: kam währenddessen ein NO-GO, nimmt sich die Freigabe selbst zurück
+          urteile=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
+            -q '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | (.body // "") | gsub("\r"; "") | split("\n") | map(select(test("^Gate-Urteil: (GO|NO-GO) "))) | .[0] // empty')
+          letztes=$(printf '%s\n' "$urteile" | tr -d '\r' | { grep -E "^Gate-Urteil: (GO|NO-GO) $SHA([^0-9a-f]|$)" || true; } | tail -n 1)
+          case "$letztes" in
+            "Gate-Urteil: NO-GO "*)
+              gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$(cat review-id)/dismissals" \
+                -f message="Gate-Urteil NO-GO am Head $SHA: automatische Freigabe zurückgezogen." -f event=DISMISS >/dev/null
+              echo "::error::NO-GO während der Freigabe eingegangen, Freigabe zurückgezogen"; exit 1 ;;
+          esac
+          echo "Freigegeben: PR #$PR am $SHA"
