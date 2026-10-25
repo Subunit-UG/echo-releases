@@ -90,6 +90,9 @@ jobs:
             throw 'No explicit authentication failure: dlib invocation is not proven'
           }
           if ((Get-FileHash $dummy -Algorithm SHA256).Hash -ne $before) { throw 'Probe changed dummy EXE bytes' }
+          # GitHub's PowerShell wrapper propagates LASTEXITCODE after this script.
+          # The expected authentication failure has now been fully checked.
+          $global:LASTEXITCODE = 0
           Write-Output 'PROBE signtool+dlib PASS (x64; authentication failure reached; dummy EXE unchanged)'
 
       - name: relic 8.2.0 startup
