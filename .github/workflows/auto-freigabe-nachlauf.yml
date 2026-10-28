@@ -1,8 +1,8 @@
 # Nachlauf der automatischen Freigabe: grün darf nie an einem Neustart hängen (TJ 2026-10-24).
 #
 # Stößt eine fehlgeschlagene oder abgebrochene "Automatische Freigabe" am aktuellen Head neu an,
-# - sobald die Freigabe-Tests dort grün durchgelaufen sind (z. B. nach einem Neustart eines
-#   wackligen Tests), oder
+# - sobald ein PR-Workflow dort grün durchgelaufen ist (z. B. nach einem Neustart eines
+#   wackligen Tests oder eines abgebrochenen Builds), oder
 # - sobald ein Gate-Urteil ("Gate-Urteil: GO <Head-SHA>") als Kommentar eingeht; fehlt am Head
 #   dann noch die Bot-Freigabe (z. B. nach einem zurückgenommenen NO-GO), auch nach grünem Lauf.
 #
@@ -20,8 +20,11 @@
 name: Automatische Freigabe – Nachlauf
 
 on:
+  # Alle Workflows, die bei Pull Requests laufen (beide Repos, gleiche Datei). Fehlt einer, bleibt
+  # die Freigabe nach dessen Neustart rot hängen (Vorfall 28.10.: macOS-Job in release-contract).
+  # Die Testsuite prüft, dass jeder pull_request-Workflow hier steht.
   workflow_run:
-    workflows: [Freigabe-Tests]
+    workflows: [Freigabe-Tests, Fleet-Manifest prüfen, release-contract, "Signing tools probe (no credentials)"]
     types: [completed]
   issue_comment:
     types: [created, edited]
