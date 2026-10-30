@@ -7,7 +7,12 @@ Dieses Repository enthält kompilierte Installer und das Updater-Manifest
 
 **Downloads:** [Releases](../../releases/latest) — macOS (Apple Silicon), Windows x64, Windows ARM64, Linux x86_64.
 
-**Auto-Update-Feed:** `https://github.com/subunit-ai/echo-releases/releases/latest/download/latest.json`
+**Auto-Update-Feed:** `https://github.com/Subunit-UG/echo-releases/releases/latest/download/latest.json`
+
+Das Repository liegt seit dem 30.10.2026 in der Organisation `Subunit-UG` (vorher Benutzerkonto
+`subunit-ai`). Bereits installierte Apps fragen noch die alte Adresse
+`https://github.com/subunit-ai/echo-releases/releases/latest/download/latest.json` ab; GitHub leitet
+sie auf dieses Repository weiter.
 
 Echo-Releases enthalten ausschließlich die Diktat-Engine (`local-whisper` bzw.
 `local-whisper-gpu`). Meeting-Aufzeichnung, Diarisierung und Voiceprints gehören

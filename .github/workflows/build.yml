@@ -1,7 +1,8 @@
 name: build
 
 # Baut + signiert Echo für alle Plattformen und published das Release HIER (public
-# echo-releases) — der Quellcode liegt PRIVAT in subunit-ai/echo-tauri und wird per
+# echo-releases) — der Quellcode liegt PRIVAT in Subunit-UG/echo-app (bis 30.10.2026
+# subunit-ai/echo-tauri, gleiche Repo-ID 1250598832) und wird per
 # read-only Deploy-Key (Secret ECHO_TAURI_DEPLOY_KEY) ausgecheckt. Weil der
 # Build in einem PUBLIC Repo läuft, sind die Runner-Minuten GRATIS (auch macOS +
 # windows-11-arm) → KEIN Billing. Genau darum liegt der Build hier statt im privaten
@@ -51,7 +52,7 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  SOURCE_REPO: subunit-ai/echo-tauri
+  SOURCE_REPO: Subunit-UG/echo-app
 
 jobs:
   # Ref (Quelle) + Tag (Release-Label) EINMAL bestimmen und streng validieren.
@@ -359,7 +360,7 @@ jobs:
             git fetch --depth 1 origin "$SOURCE_COMMIT" >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
             git checkout --detach FETCH_HEAD >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           else
-            git clone --depth 1 --branch "$REF" "git@github.com:subunit-ai/echo-tauri.git" . >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
+            git clone --depth 1 --branch "$REF" "git@github.com:$SOURCE_REPO.git" . >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           fi
           git config --unset-all core.sshCommand 2>/dev/null || true
           rm -f ~/.ssh/echo_ci

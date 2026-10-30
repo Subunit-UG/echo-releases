@@ -15,7 +15,7 @@ held = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(held)
 
 class HeldStableTests(unittest.TestCase):
     def setUp(self):
-        self.source = 'a' * 40; self.tag = 'v0.6.11'; self.repo = 'subunit-ai/echo-releases'
+        self.source = 'a' * 40; self.tag = 'v0.6.11'; self.repo = 'Subunit-UG/echo-releases'
         names = held.names(self.tag)
         names += [name + '.sig' for name in names]
         names += ['latest.json', 'echo_0.6.11_aarch64.dmg']
@@ -142,7 +142,7 @@ class HeldStableTests(unittest.TestCase):
 
 class PromotionWriteBoundary(unittest.TestCase):
     def test_failed_verification_cannot_patch_or_upload(self):
-        argv=['held-stable.py','publish','--repo','subunit-ai/echo-releases','--release-id','20',
+        argv=['held-stable.py','publish','--repo','Subunit-UG/echo-releases','--release-id','20',
               '--source-commit','a'*40,'--tag','v0.6.11','--directory','unused',
               '--receipt-sha256','b'*64,'--config','unused-config']
         with patch.object(held.sys,'argv',argv), patch.object(held,'verify',side_effect=ValueError('bad crypto')), patch.object(held,'api') as api:
@@ -213,5 +213,120 @@ class PromotionWriteBoundary(unittest.TestCase):
         with patch.object(held.sys,'argv',args), patch.object(held,'verify',return_value=(case.receipt,held.inventory(case.release))), patch.object(held,'api') as api, patch.dict('os.environ',{},clear=True):
             with self.assertRaises(ValueError): held.main()
             api.assert_not_called()
+
+
+OLD, NEW = 'subunit-ai/echo-releases', 'Subunit-UG/echo-releases'
+ALIASES = [('darwin-aarch64','darwin-aarch64-app'),('linux-x86_64','linux-x86_64-appimage'),
+           ('windows-x86_64','windows-x86_64-nsis'),('windows-aarch64','windows-aarch64-nsis')]
+
+
+class OrgMoveContract(unittest.TestCase):
+    """2026-10-30: echo-releases moved from user subunit-ai to org Subunit-UG (one repository)."""
+
+    @staticmethod
+    def manifest(directory, url_repo, tag='v0.6.11'):
+        platforms = {}
+        for name, keys in zip(held.names(tag), ALIASES):
+            (directory/(name+'.sig')).write_text('sig-'+name+'\n')
+            for key in keys:
+                platforms[key] = dict(url=f'https://github.com/{url_repo}/releases/download/{tag}/{name}', signature='sig-'+name)
+        return dict(version=tag[1:], platforms=platforms)
+
+    @staticmethod
+    def argv(action, repo, case):
+        return ['held-stable.py', action, '--repo', repo, '--release-id', '20', '--source-commit', case.source,
+                '--tag', case.tag, '--directory', 'unused']
+
+    def test_only_this_repository_under_old_user_or_new_org(self):
+        for value in (OLD, NEW, 'subunit-ug/echo-releases', 'SUBUNIT-AI/Echo-Releases'):
+            with self.subTest(value=value): self.assertTrue(held.own_repo(value))
+        for value in ('evil/echo-releases', 'subunit-ai-evil/echo-releases', 'Subunit-UG-evil/echo-releases',
+                      'Subunit-UG/echo-app', 'subunit-ai/echo-tauri', 'Subunit-UG/echo-releases-fork',
+                      'Subunit-UG/echo-releases/', ' Subunit-UG/echo-releases', 'Subunit-UG/echo-releases\n',
+                      'Subunit-UG', 'echo-releases', '', None, 42, 'Subunit-UG\\echo-releases',
+                      'github.com/Subunit-UG/echo-releases', 'Subunit-UG/echo-releases/../evil',
+                      # Unicode look-alikes that plain re.IGNORECASE would fold onto ASCII letters.
+                      'ſubunit-ai/echo-releases', 'Subunit-UG/echo-releaſes', 'subunit‐ai/echo-releases'):
+            with self.subTest(value=value): self.assertFalse(held.own_repo(value))
+
+    def test_main_accepts_both_owners_and_refuses_foreign_owner_before_any_call(self):
+        case = HeldStableTests(); case.setUp()
+        for repo in (OLD, NEW, 'subunit-ug/ECHO-RELEASES'):
+            with self.subTest(repo=repo), patch.object(held.sys,'argv',self.argv('verify',repo,case)), \
+                    patch.object(held,'verify',return_value=(case.receipt,{})) as verify, patch.object(held,'api') as api:
+                self.assertEqual(held.main(), 0)
+                self.assertEqual(verify.call_args.args[0].repo, repo); api.assert_not_called()
+        for repo in ('evil/echo-releases', 'Subunit-UG/echo-app', 'subunit-ai/echo-releases-fork', 'ſubunit-ai/echo-releases'):
+            for action in ('seal', 'verify', 'publish'):
+                with self.subTest(repo=repo, action=action), patch.object(held.sys,'argv',self.argv(action,repo,case)), \
+                        patch.object(held,'seal') as seal, patch.object(held,'verify') as verify, patch.object(held,'api') as api:
+                    with self.assertRaisesRegex(ValueError, 'invalid repository'): held.main()
+                    seal.assert_not_called(); verify.assert_not_called(); api.assert_not_called()
+
+    def test_receipt_owner_may_differ_only_between_old_user_and_new_org(self):
+        case = HeldStableTests(); case.setUp()
+        for sealed, current in ((OLD, NEW), (NEW, NEW), (OLD, OLD), (NEW, OLD)):
+            with self.subTest(sealed=sealed, current=current):
+                held.validate_run(dict(case.receipt, repo=sealed), case.run, case.jobs, current)
+        for sealed, current in (('evil/echo-releases', NEW), (OLD, 'evil/echo-releases'), (None, NEW),
+                                ('Subunit-UG/echo-app', NEW), (NEW, '')):
+            with self.subTest(sealed=sealed, current=current), self.assertRaisesRegex(ValueError, 'repository mismatch'):
+                held.validate_run(dict(case.receipt, repo=sealed), case.run, case.jobs, current)
+
+    def test_manifest_urls_bind_to_the_exact_sealed_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            for owner in (OLD, NEW):
+                held.check_manifest(self.manifest(directory, owner), 'v0.6.11', owner, directory)
+            for url_repo, bound in ((OLD, NEW), (NEW, OLD), ('evil/echo-releases', 'evil/echo-releases'),
+                                    ('evil/echo-releases', NEW)):
+                with self.subTest(url_repo=url_repo, bound=bound), self.assertRaises(ValueError):
+                    held.check_manifest(self.manifest(directory, url_repo), 'v0.6.11', bound, directory)
+            mixed = self.manifest(directory, NEW)
+            mixed['platforms']['windows-x86_64']['url'] = mixed['platforms']['windows-x86_64']['url'].replace(NEW, OLD)
+            with self.assertRaises(ValueError): held.check_manifest(mixed, 'v0.6.11', NEW, directory)
+
+    def test_draft_sealed_before_move_verifies_after_move_end_to_end(self):
+        import argparse, contextlib, hashlib, io, types
+        tag, source = 'v0.6.11', 'a'*40
+        case = HeldStableTests(); case.setUp()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); staging = root/'staging'; staging.mkdir()
+            # Built and sealed under the old owner: receipt and every manifest URL say subunit-ai.
+            manifest = self.manifest(staging, OLD, tag)
+            files = {name+'.sig': (staging/(name+'.sig')).read_bytes() for name in held.names(tag)}
+            files.update({name: b'artifact '+name.encode() for name in held.names(tag)})
+            files['latest.json'] = json.dumps(manifest).encode(); files['echo_0.6.11_aarch64.dmg'] = b'dmg'
+            ids = {name: index+1 for index, name in enumerate(sorted(files))}
+            receipt = dict(schema=1, repo=OLD, release_id=20, tag=tag, source_commit=source, run_id=55, run_attempt=1,
+                           workflow_commit='c'*40, requires_platform_trust=False, public_key_sha256='d'*64,
+                           assets={name: dict(id=ids[name], size=len(data), sha256=hashlib.sha256(data).hexdigest())
+                                   for name, data in files.items()})
+            files[held.RECEIPT] = (json.dumps(receipt, sort_keys=True, indent=2)+'\n').encode(); ids[held.RECEIPT] = 100
+            by_id = {ids[name]: data for name, data in files.items()}
+            release = dict(id=20, tag_name=tag, draft=True, prerelease=False, body=held.MARKER,
+                           assets=[dict(name=name, state='uploaded', id=ids[name], size=len(data)) for name, data in files.items()])
+            calls = []
+            def api(repo, route, *extra, **kwargs):
+                calls.append(repo); return {'releases/20': release, 'actions/runs/55': case.run}[route]
+            def download(repo, asset, path):
+                calls.append(repo); path.write_bytes(by_id[asset['id']])
+            def run(command, **kwargs):
+                calls.append(command[-1].split('/')[1]+'/'+command[-1].split('/')[2])
+                return types.SimpleNamespace(stdout=json.dumps([{'jobs': case.jobs}]).encode())
+            updater = types.SimpleNamespace(verify=lambda namespace: {'public_key_sha256': 'd'*64})
+            # Promoted after the move: github.repository is now the org name.
+            args = argparse.Namespace(repo=NEW, release_id=20, source_commit=source, tag=tag, directory=root/'proof',
+                                      receipt_sha256=hashlib.sha256(files[held.RECEIPT]).hexdigest(), config=root/'config')
+            with patch.object(held,'canonical',side_effect=lambda repo,*rest: calls.append(repo)), \
+                    patch.object(held,'api',side_effect=api), patch.object(held,'download',side_effect=download), \
+                    patch.object(held.subprocess,'run',side_effect=run), \
+                    patch.object(held.importlib.util,'spec_from_file_location'), \
+                    patch.object(held.importlib.util,'module_from_spec',return_value=updater), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                sealed, assets = held.verify(args)
+            self.assertEqual(sealed['repo'], OLD)
+            self.assertEqual(set(calls), {NEW})
+            self.assertEqual(set(assets), set(files))
 
 if __name__=='__main__': unittest.main()
