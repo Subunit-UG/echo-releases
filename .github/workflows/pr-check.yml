@@ -12,6 +12,7 @@
 # ZWEITER GRUND — im privaten echo-tauri ist ein ECHTES Gate technisch unmöglich:
 # Branch-Protection und Rulesets sind auf dem aktuellen Plan für private Repos
 # gesperrt (verifiziert: GET /repos/subunit-ai/echo-tauri/branches/main/protection
+# — das Repo heißt seit 30.10.2026 Subunit-UG/echo-app —
 # und /rulesets → beide HTTP 403 "Upgrade to GitHub Pro or make this repository
 # public to enable this feature."). Ein Check dort kann also NIE "required" sein.
 # Der einzige wirksame Riegel ist darum client-seitig: scripts/session/ship.sh im
@@ -23,7 +24,7 @@
 #
 # AUSGELÖST VON — so wird dieser Lauf künftig angestossen (EIN Satz):
 #   `scripts/session/ship.sh` im Quell-Repo pusht den Branch, startet mit
-#   `gh workflow run pr-check.yml -R subunit-ai/echo-releases -f ref=<branch>`
+#   `gh workflow run pr-check.yml -R Subunit-UG/echo-releases -f ref=<branch>`
 #   genau diesen Workflow, wartet per `gh run watch --exit-status` auf seine
 #   Conclusion und squash-merged NUR bei grün (`--no-wait` ist der bewusste,
 #   sichtbare Notausgang).
@@ -91,7 +92,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SOURCE_REPO: subunit-ai/echo-tauri
+  SOURCE_REPO: Subunit-UG/echo-app
   # Bewusst NICHT gesetzt: RUST_BACKTRACE; Diagnostik bleibt vertraulich.
 
 jobs:

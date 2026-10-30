@@ -20,11 +20,19 @@ RECEIPT = 'held-stable-receipt.json'
 SHA = re.compile(r'[0-9a-f]{40}')
 HASH = re.compile(r'[0-9a-f]{64}')
 TAG = re.compile(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
+# This repository moved on 2026-10-30 from the user account subunit-ai to the
+# organization Subunit-UG under the same name; both names address one repository.
+# Exactly these two owners, ASCII only (case-insensitive like GitHub), nothing else.
+OWN_REPO = re.compile(r'(?:subunit-ai|subunit-ug)/echo-releases', re.ASCII | re.IGNORECASE)
 
 
 def require(value, message):
     if not value:
         raise ValueError(message)
+
+
+def own_repo(value):
+    return type(value) is str and OWN_REPO.fullmatch(value) is not None
 
 
 def digest(path):
@@ -109,7 +117,8 @@ def validate_receipt(receipt, release, source, tag, release_id):
 
 
 def validate_run(receipt, run, jobs, repo):
-    require(receipt.get('repo') == repo, 'repository mismatch')
+    # A draft sealed before the org move records the old owner; same repository.
+    require(own_repo(receipt.get('repo')) and own_repo(repo), 'repository mismatch')
     require(type(receipt.get('run_id')) is int and receipt['run_id'] > 0, 'invalid build run')
     require(type(receipt.get('run_attempt')) is int and receipt['run_attempt'] > 0, 'invalid build attempt')
     require(run.get('id') == receipt['run_id'] and run.get('run_attempt') == receipt['run_attempt'],
@@ -141,6 +150,7 @@ def names(tag):
 
 
 def check_manifest(manifest, tag, repo, directory):
+    require(own_repo(repo), 'invalid manifest repository')
     expected = {}
     artifacts = names(tag)
     keys = [('darwin-aarch64', 'darwin-aarch64-app'), ('linux-x86_64', 'linux-x86_64-appimage'),
@@ -218,7 +228,10 @@ def verify(args):
     for name, expected in receipt['assets'].items():
         download(args.repo, assets[name], args.directory / name)
         require(digest(args.directory / name) == expected['sha256'], 'asset bytes changed')
-    check_manifest(json.loads((args.directory / 'latest.json').read_text()), args.tag, args.repo, args.directory)
+    # The build wrote its own repository name into every URL, and the seal recorded
+    # that same name. Bind URLs to the receipt, not to today's name, so a draft built
+    # before the org move keeps its exact old-owner URLs (GitHub redirects them).
+    check_manifest(json.loads((args.directory / 'latest.json').read_text()), args.tag, receipt['repo'], args.directory)
     spec = importlib.util.spec_from_file_location('updater', Path(__file__).with_name('verify-updater-signatures.py'))
     module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
     pairs = [(('echo.app.tar.gz' if i == 0 else name), str(args.directory / name),
@@ -268,7 +281,7 @@ def main():
     parser.add_argument('--receipt-sha256')
     parser.add_argument('--config', type=Path)
     args = parser.parse_args()
-    require(args.repo == 'subunit-ai/echo-releases' and args.release_id > 0, 'invalid repository/release')
+    require(own_repo(args.repo) and args.release_id > 0, 'invalid repository/release')
     if args.action == 'seal':
         seal(args)
     else:

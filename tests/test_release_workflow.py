@@ -837,7 +837,7 @@ class NumericReleaseAssetUploaderContract(unittest.TestCase):
                 mock.patch.object(
                     sys,
                     "argv",
-                    ["upload", "subunit-ai/echo-releases", "42", "latest.json", str(payload)],
+                    ["upload", "Subunit-UG/echo-releases", "42", "latest.json", str(payload)],
                 ),
                 contextlib.redirect_stdout(output),
             ):
@@ -846,7 +846,7 @@ class NumericReleaseAssetUploaderContract(unittest.TestCase):
             request = captured["request"]
             self.assertEqual(
                 request.full_url,
-                "https://uploads.github.com/repos/subunit-ai/echo-releases/releases/42/assets?name=latest.json",
+                "https://uploads.github.com/repos/Subunit-UG/echo-releases/releases/42/assets?name=latest.json",
             )
             self.assertNotIn("synthetic-token", request.full_url)
             self.assertEqual(request.data, payload.read_bytes())
@@ -865,7 +865,7 @@ class NumericReleaseAssetUploaderContract(unittest.TestCase):
                     mock.patch.object(
                         sys,
                         "argv",
-                        ["upload", "subunit-ai/echo-releases", release_id, "latest.json", str(payload)],
+                        ["upload", "Subunit-UG/echo-releases", release_id, "latest.json", str(payload)],
                     ),
                     contextlib.redirect_stderr(io.StringIO()),
                     self.assertRaises(SystemExit),
@@ -886,7 +886,7 @@ class ReleaseAssetResolverContract(unittest.TestCase):
         )
         fake_gh.chmod(0o755)
         script = f'''source "{RELEASE_ASSETS}"
-RELEASE_ASSETS_REPO=subunit-ai/echo-releases
+RELEASE_ASSETS_REPO=Subunit-UG/echo-releases
 RELEASE_ASSETS_JSON="$ASSETS_JSON"
 release_asset_download expected.bin "$DESTINATION" || exit 1
 printf 'asset_id=%s\\n' "$RELEASE_ASSET_LAST_ID"
@@ -1089,6 +1089,57 @@ class MacOSArchiveValidatorContract(unittest.TestCase):
             str(MACOS_ARCHIVE_VALIDATOR),
             "exec",
         )
+
+
+SOURCE_REPO = "Subunit-UG/echo-app"
+SOURCE_WORKFLOWS = ("build.yml", "pr-check.yml", "promote-stable.yml")
+
+
+def owner_move_errors(texts: dict[str, str]) -> list[str]:
+    """Org move 2026-10-30: one canonical private source, no retired owner in executable lines."""
+    errors: list[str] = []
+    for name, text in texts.items():
+        code = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+        if any("subunit-ai" in line.lower() for line in code):
+            errors.append(f"{name}: retired owner subunit-ai outside comments")
+        if name not in SOURCE_WORKFLOWS:
+            continue
+        settings = [line.strip() for line in code if line.strip().startswith("SOURCE_REPO:")]
+        if settings != [f"SOURCE_REPO: {SOURCE_REPO}"]:
+            errors.append(f"{name}: SOURCE_REPO must be set exactly once to {SOURCE_REPO}")
+        urls = re.findall(r"git@github\.com:[^\s\"']+", text)
+        if not urls or any(url != "git@github.com:$SOURCE_REPO.git" for url in urls):
+            errors.append(f"{name}: private source must be addressed only via $SOURCE_REPO")
+    return errors
+
+
+class OrgMoveWorkflowContract(unittest.TestCase):
+    def setUp(self) -> None:
+        github = ROOT / ".github"
+        self.texts = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in sorted(github.rglob("*"))
+            if path.is_file() and path.suffix in {".yml", ".yaml", ".cjs", ".js", ".sh", ".py"}
+        }
+
+    def test_workflows_use_one_canonical_source_and_no_retired_owner(self) -> None:
+        self.assertTrue(set(SOURCE_WORKFLOWS) <= set(self.texts))
+        self.assertEqual(owner_move_errors(self.texts), [])
+
+    def test_each_owner_regression_is_detected(self) -> None:
+        build = self.texts["build.yml"]
+        mutations = {
+            "old source owner": ("build.yml", build.replace(f"SOURCE_REPO: {SOURCE_REPO}", "SOURCE_REPO: subunit-ai/echo-tauri")),
+            "hardcoded source URL": ("build.yml", build.replace(
+                '"git@github.com:$SOURCE_REPO.git" .', '"git@github.com:Subunit-UG/echo-app.git" .', 1)),
+            "second SOURCE_REPO": ("promote-stable.yml", self.texts["promote-stable.yml"].replace(
+                "concurrency:", "  SOURCE_REPO: Subunit-UG/echo-tauri\nconcurrency:", 1)),
+            "retired owner in a step": ("auto-freigabe.yml", self.texts["auto-freigabe.yml"] + "\n      - run: gh api repos/subunit-ai/echo-releases\n"),
+        }
+        for label, (name, mutated) in mutations.items():
+            with self.subTest(label=label):
+                self.assertNotEqual(mutated, self.texts[name])
+                self.assertNotEqual(owner_move_errors({**self.texts, name: mutated}), [])
 
 
 if __name__ == "__main__":

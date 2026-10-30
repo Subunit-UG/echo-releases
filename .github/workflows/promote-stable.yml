@@ -19,6 +19,9 @@ on:
 
 permissions:
   contents: read
+env:
+  # Privates Quell-Repo, kanonischer Name seit 30.10.2026 (vorher subunit-ai/echo-tauri).
+  SOURCE_REPO: Subunit-UG/echo-app
 concurrency:
   group: echo-release-build
   cancel-in-progress: false
@@ -52,7 +55,7 @@ jobs:
           chmod 600 ~/.ssh/echo_ci
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
           git init _source >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
-          git -C _source remote add origin git@github.com:subunit-ai/echo-tauri.git >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
+          git -C _source remote add origin "git@github.com:$SOURCE_REPO.git" >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           git -C _source fetch --depth 1 origin "$SOURCE_COMMIT" >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           git -C _source checkout --detach FETCH_HEAD >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           rm -f ~/.ssh/echo_ci
@@ -220,7 +223,7 @@ jobs:
           chmod 600 ~/.ssh/echo_ci
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
           git init _source >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
-          git -C _source remote add origin git@github.com:subunit-ai/echo-tauri.git >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
+          git -C _source remote add origin "git@github.com:$SOURCE_REPO.git" >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           git -C _source fetch --depth 1 origin "$SOURCE_COMMIT" >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           git -C _source checkout --detach FETCH_HEAD >/dev/null 2>&1 || { echo "::error::private source checkout failed"; exit 1; }
           rm -f ~/.ssh/echo_ci

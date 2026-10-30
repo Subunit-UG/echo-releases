@@ -107,7 +107,7 @@ Bei ausdrücklich aktivierter Notarisierung wird das Developer-ID-Zertifikat nic
 
 ## Probe und offene Verifikation
 
-Die separate [Echo-Probe](https://github.com/subunit-ai/echo-releases/blob/feat/signing-ready-20261024/.github/workflows/signing-probe.yml)
+Die separate [Echo-Probe](https://github.com/Subunit-UG/echo-releases/blob/feat/signing-ready-20261024/.github/workflows/signing-probe.yml)
 läuft per `pull_request` ausschließlich bei Änderungen an der Probe-Datei oder
 `scripts/sign-windows.ps1`, außerdem manuell per `workflow_dispatch`, sobald
 GitHub den Workflow auf dem Default-Branch registriert hat. Die einzige
@@ -122,7 +122,7 @@ Erfolgskriterium; DLL-Ladefehler und falsche Architektur schlagen fehl.
 `relic` 8.2.0 wird unabhängig per `--version` und `--help` gestartet.
 Es werden keine Release-Dateien signiert.
 
-[Probe vom 25.10.2026: erfolgreich](https://github.com/subunit-ai/echo-releases/actions/runs/40195087632)
+[Probe vom 25.10.2026: erfolgreich](https://github.com/Subunit-UG/echo-releases/actions/runs/40195087632)
 auf dem Code-Stand `c79cdd6d8dce4f4a28868b5fd21e1bdcf0d8abb2`:
 
 | Runner | SignTool + dlib | relic |
@@ -164,7 +164,7 @@ Job-Umbau nicht um und verändert weder die Updater- noch die Lockstep-Logik.
 Der vollständige Build-Lauf meldet unverändert den bereits auf main vorhandenen
 SC2015-Hinweis; der Probe-Workflow besteht auch den vollständigen Lauf.
 Die vollständige Echo-Suite umfasst 71 Tests: lokal 68 bestanden, drei wegen
-fehlendem `minisign` übersprungen. Im [GitHub-Contract-Lauf](https://github.com/subunit-ai/echo-releases/actions/runs/40195087639)
+fehlendem `minisign` übersprungen. Im [GitHub-Contract-Lauf](https://github.com/Subunit-UG/echo-releases/actions/runs/40195087639)
 bestehen alle 71 Tests ohne Auslassung; die synthetischen Hosted-Prüfungen
 bestehen ebenfalls auf allen vier Build-Runnern. Der Azure-Vertrag erlaubt Azure-Aktionen und
 -Variablen ausschließlich in Schritten mit der exakten Windows-/Backend-Bedingung.
