@@ -1142,5 +1142,66 @@ class OrgMoveWorkflowContract(unittest.TestCase):
                 self.assertNotEqual(owner_move_errors({**self.texts, name: mutated}), [])
 
 
+# GitHub retired the macos-14 runner image on 2026-11-02 (build host moved to macos-15).
+RETIRED_MACOS_RUNNERS = ("macos-13", "macos-14")
+
+
+def macos_runner_errors(texts: dict[str, str]) -> list[str]:
+    """One macOS runner label everywhere; every platform condition must hit a build host.
+
+    A half-done runner switch fails silently: a stale `matrix.platform == '<old>'`
+    skips signing, notarization and the deployment target without any red step.
+    """
+    hosts = re.findall(r"^          - platform: (\S+)$", texts["build.yml"], re.M)
+    mac = [host for host in hosts if host.startswith("macos-")]
+    if len(hosts) != 4 or len(mac) != 1:
+        return [f"build.yml: expected four matrix hosts with exactly one macOS host, got {hosts}"]
+    errors: list[str] = []
+    if mac[0] in RETIRED_MACOS_RUNNERS:
+        errors.append(f"build.yml: macOS host {mac[0]} is a retired runner image")
+    for name, text in texts.items():
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        for label in sorted(set(re.findall(r"\bmacos-(?:latest|\d+)\b", code)) - {mac[0]}):
+            errors.append(f"{name}: macOS runner {label} differs from build host {mac[0]}")
+        for label in sorted(set(re.findall(r"matrix\.platform == '([^']+)'", code)) - set(hosts)):
+            errors.append(f"{name}: condition on {label} matches no build matrix host")
+    return errors
+
+
+class MacOSRunnerContract(unittest.TestCase):
+    def setUp(self) -> None:
+        github = ROOT / ".github"
+        self.texts = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in sorted(github.rglob("*"))
+            if path.is_file() and path.suffix in {".yml", ".yaml", ".cjs", ".js", ".sh", ".py"}
+        }
+
+    def test_one_current_macos_runner_and_no_stale_platform_condition(self) -> None:
+        self.assertEqual(macos_runner_errors(self.texts), [])
+        build = self.texts["build.yml"]
+        self.assertGreaterEqual(build.count("matrix.platform == 'macos-15'"), 6)
+        self.assertIn("runs-on: macos-15", self.texts["promote-stable.yml"])
+        self.assertIn("xcode_app=/Applications/Xcode_16.4.app", build)
+        self.assertIn('sudo xcode-select -s "$xcode_app/Contents/Developer"', build)
+        self.assertIn('echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"', build)
+
+    def test_each_partial_runner_switch_is_detected(self) -> None:
+        build = self.texts["build.yml"]
+        mutations = {
+            "stale signing condition": ("build.yml", build.replace(
+                "matrix.platform == 'macos-15'", "matrix.platform == 'macos-14'", 1)),
+            "retired build host everywhere in build.yml": ("build.yml", build.replace("macos-15", "macos-14")),
+            "promotion verifier on another runner": ("promote-stable.yml", self.texts["promote-stable.yml"].replace(
+                "runs-on: macos-15", "runs-on: macos-14")),
+            "hosted proof on another runner": ("release-contract.yml", self.texts["release-contract.yml"].replace(
+                "macos-15", "macos-latest")),
+        }
+        for label, (name, mutated) in mutations.items():
+            with self.subTest(label=label):
+                self.assertNotEqual(mutated, self.texts[name])
+                self.assertNotEqual(macos_runner_errors({**self.texts, name: mutated}), [])
+
+
 if __name__ == "__main__":
     unittest.main()

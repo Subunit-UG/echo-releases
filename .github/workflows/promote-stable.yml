@@ -86,7 +86,7 @@ jobs:
   verify_macos_platform_trust:
     needs: proof
     if: needs.proof.outputs.requires_platform_trust == 'true'
-    runs-on: macos-14
+    runs-on: macos-15
     # GitHub exposes unpublished draft releases only to push-capable tokens.
     # The verifier remains read-only; the workflow contract forbids mutations.
     permissions:
