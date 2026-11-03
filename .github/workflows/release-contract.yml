@@ -70,7 +70,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [ubuntu-24.04, macos-14, windows-latest, windows-11-arm]
+        platform: [ubuntu-24.04, macos-15, windows-latest, windows-11-arm]
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 10
     steps:
@@ -84,6 +84,18 @@ jobs:
           ref: 84b9d35b5fc46c1e45415bdb6144030364f7ebc5
           path: _public-upstream
           persist-credentials: false
+      - name: macOS build host provides the pinned Xcode (same pin as build.yml)
+        # Der Release-Build pinnt Xcode statt den Image-Standard zu nehmen. Diese Probe läuft bei
+        # jedem PR auf demselben Runner-Image und meldet einen fehlenden Pin, bevor ein Release scheitert.
+        if: matrix.platform == 'macos-15'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin=$(sed -n 's|^ *xcode_app=\(/Applications/Xcode_[0-9.]*\.app\)$|\1|p' .github/workflows/build.yml)
+          [ -n "$pin" ] || { echo "::error::Xcode-Pin in build.yml nicht gefunden"; exit 1; }
+          ls -d /Applications/Xcode*.app
+          [ -d "$pin" ] || { echo "::error::$pin fehlt im Runner-Image macos-15"; exit 1; }
+          DEVELOPER_DIR="$pin/Contents/Developer" xcodebuild -version
       - name: Prepare public fixture
         shell: bash
         run: node tests/fixtures/confidential-hosted/probe.cjs prepare

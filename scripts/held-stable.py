@@ -131,8 +131,11 @@ def validate_run(receipt, run, jobs, repo):
             SHA.fullmatch(receipt.get('workflow_commit', '')), 'workflow revision mismatch')
     names = [job['name'] for job in jobs]
     require(len(names) == len(set(names)), 'ambiguous build jobs')
-    for platform in ('ubuntu-24.04', 'windows-latest', 'windows-11-arm', 'macos-14'):
-        matches = [job for job in jobs if platform in job['name'] and job['name'].startswith('build (')]
+    # The macOS build runner moved from macos-14 (retired 2026-11-02) to macos-15 on
+    # 2026-11-01; drafts sealed before that keep the old job name. Exactly one per slot.
+    for labels in (('ubuntu-24.04',), ('windows-latest',), ('windows-11-arm',), ('macos-15', 'macos-14')):
+        matches = [job for job in jobs if job['name'].startswith('build (')
+                   and any(label in job['name'] for label in labels)]
         require(len(matches) == 1 and matches[0].get('conclusion') == 'success', 'incomplete platform matrix')
     for name in ('verify_updater_trust', 'platform_trust', 'publish'):
         matches = [job for job in jobs if job['name'] == name]

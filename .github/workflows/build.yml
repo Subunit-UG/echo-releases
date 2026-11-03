@@ -295,7 +295,7 @@ jobs:
             args: "--features local-whisper-gpu"
           - platform: windows-11-arm
             args: "--features local-whisper"
-          - platform: macos-14
+          - platform: macos-15
             args: "--target aarch64-apple-darwin --features local-whisper"
 
     runs-on: ${{ matrix.platform }}
@@ -476,9 +476,21 @@ jobs:
         with:
           arch: arm64
 
-      - name: macOS build env (cmake + deployment target for whisper.cpp std::filesystem)
-        if: matrix.platform == 'macos-14'
+      # macos-14 wurde am 02.11.2026 außer Betrieb genommen (Standard dort Xcode 15.4).
+      # Xcode ist fest gepinnt statt Image-Standard: ein späterer Standardwechsel des
+      # Images (z. B. auf Xcode 26) darf Toolchain und Notarisierung nicht still ändern.
+      # Fehlt die Version im Image, bricht der Build hier sichtbar ab (bewusst anheben).
+      # Mindest-macOS bleibt unabhängig vom Runner: 11.0 hier und minimumSystemVersion
+      # in der tauri.conf.json des Quell-Repos.
+      - name: macOS build env (Xcode pin, cmake, deployment target for whisper.cpp std::filesystem)
+        if: matrix.platform == 'macos-15'
         run: |
+          set -euo pipefail
+          xcode_app=/Applications/Xcode_16.4.app
+          [ -d "$xcode_app" ] || { echo "::error::$xcode_app fehlt im Runner-Image; Xcode-Pin bewusst anheben"; exit 1; }
+          sudo xcode-select -s "$xcode_app/Contents/Developer"
+          xcodebuild -version
+          echo "macOS SDK $(xcrun --sdk macosx --show-sdk-version)"
           brew list cmake >/dev/null 2>&1 || brew install cmake
           echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
           echo "CMAKE_OSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
@@ -489,7 +501,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          targets: ${{ matrix.platform == 'macos-14' && 'aarch64-apple-darwin' || '' }}
+          targets: ${{ matrix.platform == 'macos-15' && 'aarch64-apple-darwin' || '' }}
 
       - name: Verify release label matches every app version
         shell: bash
@@ -647,7 +659,7 @@ jobs:
           'args=--config src-tauri/tauri.windows-signing.json' >> $env:GITHUB_OUTPUT
 
       - name: macOS signing keychain (stable self-signed cert — keeps TCC grants across updates)
-        if: matrix.platform == 'macos-14'
+        if: matrix.platform == 'macos-15'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -677,7 +689,7 @@ jobs:
           security find-identity -v -p codesigning build.keychain
 
       - name: Configure explicitly enabled macOS notarization
-        if: matrix.platform == 'macos-14' && vars.APPLE_NOTARIZE_METHOD != ''
+        if: matrix.platform == 'macos-15' && vars.APPLE_NOTARIZE_METHOD != ''
         shell: bash
         env:
           APPLE_NOTARIZE_METHOD: ${{ vars.APPLE_NOTARIZE_METHOD }}
@@ -767,7 +779,7 @@ jobs:
           }
 
       - name: Verify explicitly enabled macOS notarization
-        if: matrix.platform == 'macos-14' && vars.APPLE_NOTARIZE_METHOD != ''
+        if: matrix.platform == 'macos-15' && vars.APPLE_NOTARIZE_METHOD != ''
         shell: bash
         run: |
           set -euo pipefail
@@ -780,7 +792,7 @@ jobs:
           xcrun stapler validate "$dmg"
 
       - name: Remove notarization API key
-        if: always() && matrix.platform == 'macos-14' && vars.APPLE_NOTARIZE_METHOD == 'api-key'
+        if: always() && matrix.platform == 'macos-15' && vars.APPLE_NOTARIZE_METHOD == 'api-key'
         shell: bash
         run: rm -f -- "$RUNNER_TEMP/notarization-key.p8"
 
@@ -895,7 +907,7 @@ jobs:
   verify_macos_platform_trust:
     needs: [prepare, reserve, build]
     if: needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.requires_platform_trust == 'true'
-    runs-on: macos-14
+    runs-on: macos-15
     # GitHub exposes unpublished draft releases only to push-capable tokens.
     # The verifier remains read-only; the workflow contract forbids mutations.
     permissions:

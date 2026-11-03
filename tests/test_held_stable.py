@@ -3,6 +3,7 @@ from pathlib import Path
 import copy
 import importlib.util
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -29,7 +30,7 @@ class HeldStableTests(unittest.TestCase):
         self.run = dict(id=55,run_attempt=1,path='.github/workflows/build.yml',event='workflow_dispatch',
                         status='completed',conclusion='success',head_sha='c'*40)
         self.jobs = [dict(name=f'build ({platform}, --features local)',conclusion='success') for platform in
-                     ('ubuntu-24.04','windows-latest','windows-11-arm','macos-14')]
+                     ('ubuntu-24.04','windows-latest','windows-11-arm','macos-15')]
         self.jobs += [dict(name=name,conclusion='success') for name in ('verify_updater_trust','platform_trust','publish')]
 
     def validate(self):
@@ -88,6 +89,23 @@ class HeldStableTests(unittest.TestCase):
                 elif action=='remove': jobs.pop(0)
                 else: jobs.append(copy.deepcopy(jobs[0]))
                 with self.assertRaises(ValueError): held.validate_run(self.receipt,self.run,jobs,self.repo)
+
+    def test_legacy_macos14_run_sealed_before_runner_switch_still_validates(self):
+        jobs=[dict(job,name=job['name'].replace('macos-15','macos-14')) for job in self.jobs]
+        self.assertNotEqual(jobs,self.jobs)
+        held.validate_run(self.receipt,self.run,jobs,self.repo)
+
+    def test_two_macos_builds_in_one_run_are_ambiguous(self):
+        jobs=self.jobs+[dict(name='build (macos-14, --features local)',conclusion='success')]
+        with self.assertRaises(ValueError): held.validate_run(self.receipt,self.run,jobs,self.repo)
+
+    def test_current_build_matrix_job_names_validate(self):
+        build=(ROOT/'.github/workflows/build.yml').read_text()
+        hosts=re.findall(r'^          - platform: (\S+)$',build,re.M)
+        self.assertEqual(len(hosts),4)
+        jobs=[dict(name=f'build ({host}, --features local)',conclusion='success') for host in hosts]
+        jobs+=[dict(name=name,conclusion='success') for name in ('verify_updater_trust','platform_trust','publish')]
+        held.validate_run(self.receipt,self.run,jobs,self.repo)
 
     def test_run_attempt_and_revision_and_event_pins(self):
         for key,value in [('run_attempt',2),('head_sha','d'*40),('conclusion','failure'),('event','schedule'),('path','.github/workflows/pr-check.yml')]:
