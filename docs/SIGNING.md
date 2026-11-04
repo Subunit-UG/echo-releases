@@ -81,6 +81,13 @@ Bei ausdrücklich gewählter Notarisierung ist eine
 | `apple-id` | `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` |
 | `api-key` | `APPLE_API_ISSUER`, `APPLE_API_KEY` (Key-ID), `APPLE_API_PRIVATE_KEY` (vollständiger roher .p8-Inhalt) |
 
+Ablage: Die Apple-Secrets und die Auswahlvariable gehören in die Umgebung
+`release-signing` (Repository › Settings › Environments), deren
+Deployment-Regel nur den Zweig `main` zulässt. Der `build`-Job referenziert diese
+Umgebung; Workflows auf anderen Zweigen bekommen die Developer-ID-Identität
+dadurch nicht. Für eine spätere Azure-Federation lautet das OIDC-Subject
+entsprechend `repo:Subunit-UG/echo-releases:environment:release-signing`.
+
 Auswahlvariable: `APPLE_NOTARIZE_METHOD`. Im API-Key-Pfad wird die .p8 nur im
 Job unter `RUNNER_TEMP` mit `umask 077` und Modus `0600` geschrieben.
 `APPLE_API_KEY_PATH` entsteht ausschließlich zur Laufzeit; kein Pfad-Secret

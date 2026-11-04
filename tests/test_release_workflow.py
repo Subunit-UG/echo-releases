@@ -24,6 +24,7 @@ CONTRACT_WORKFLOW = (ROOT / ".github/workflows/release-contract.yml").read_text(
 PR_CHECK_WORKFLOW = (ROOT / ".github/workflows/pr-check.yml").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 PLATFORM_TRUST_DOC = (ROOT / "docs/PLATFORM-TRUST.md").read_text(encoding="utf-8")
+SIGNING_DOC = (ROOT / "docs/SIGNING.md").read_text(encoding="utf-8")
 POLICY = ROOT / "scripts" / "release_policy.sh"
 MACOS_VERIFIER = ROOT / "scripts" / "verify-platform-macos.sh"
 MACOS_ARCHIVE_VALIDATOR = ROOT / "scripts" / "validate-macos-app-archive.py"
@@ -156,6 +157,15 @@ class ReleaseWorkflowContract(unittest.TestCase):
         self.assertIn("source_commit: ${{ steps.source.outputs.commit }}", WORKFLOW)
         self.assertIn('[ "$(git rev-parse HEAD)" = "$SOURCE_COMMIT" ]', WORKFLOW)
         self.assertIn('[ "$(git -C _source rev-parse HEAD)" = "$SOURCE_COMMIT" ]', WORKFLOW)
+
+    def test_apple_signing_secrets_only_reach_the_main_bound_release_environment(self) -> None:
+        jobs = re.split(r"\n  (?=[a-z_]+:\n)", WORKFLOW.split("\njobs:\n", 1)[1])
+        apple = ("APPLE_CERTIFICATE", "APPLE_API_PRIVATE_KEY", "APPLE_PASSWORD")
+        users = [job.split(":", 1)[0].strip() for job in jobs if any(f"secrets.{name}" in job for name in apple)]
+        self.assertEqual(users, ["build"])
+        build = next(job for job in jobs if job.lstrip().startswith("build:"))
+        self.assertRegex(build, r"\n    environment: release-signing\n")
+        self.assertIn("`release-signing`", SIGNING_DOC)
 
     def test_public_build_never_caches_private_compiler_outputs(self) -> None:
         for name, workflow in (("build.yml", WORKFLOW), ("pr-check.yml", PR_CHECK_WORKFLOW)):
