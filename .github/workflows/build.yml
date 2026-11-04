@@ -279,6 +279,12 @@ jobs:
   build:
     needs: [prepare, reserve]
     if: needs.prepare.outputs.should_build == 'true'
+    # Developer-ID-Zertifikat und Notarisierungsschlüssel liegen als Secrets der
+    # Umgebung `release-signing`, deren Deployment-Regel nur `main` zulässt. Ein
+    # Workflow auf einem anderen Zweig (auch per push eines Schreibberechtigten)
+    # bekommt sie dadurch nicht, die Apple-vertraute Identität bleibt im
+    # geprüften Release-Weg (TJ 04.11.2026: Echo für Mac notarisieren).
+    environment: release-signing
     permissions:
       contents: write
       id-token: write # Tauri signs during bundling; no OIDC access in publish/verification jobs.
@@ -658,7 +664,7 @@ jobs:
           } | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM 'src-tauri/tauri.windows-signing.json'
           'args=--config src-tauri/tauri.windows-signing.json' >> $env:GITHUB_OUTPUT
 
-      - name: macOS signing keychain (stable self-signed cert — keeps TCC grants across updates)
+      - name: macOS signing keychain (Developer ID when notarizing, else the stable self-signed cert)
         if: matrix.platform == 'macos-15'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
