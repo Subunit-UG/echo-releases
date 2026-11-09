@@ -1,4 +1,4 @@
-# Automatische Freigabe: grüne PRs blockieren nie (TJ 2026-10-24).
+# Automatische Freigabe: grüne PRs blockieren nie.
 #
 # main verlangt eine Freigabe einer anderen Identität (Branch-Schutz seit 2026-10-23).
 # Diese Freigabe gibt github-actions[bot], sobald die volle Testsuite und ALLE übrigen
@@ -15,7 +15,7 @@
 # - "Volle Testsuite" und "Automatische Freigabe" sind Pflicht-Checks auf main.
 # - Ändert ein PR etwas unter .github/ oder scripts/ (Prüf- und Release-Weg selbst: was als
 #   grün gilt und was mit Signier-Geheimnissen läuft), definiert er sein Grün selbst. Dann gibt es die Freigabe erst mit
-#   dem Gate-Urteil einer zweiten Instanz am exakten Head (Canon Release-Gate): eine
+#   dem Gate-Urteil einer zweiten Instanz am exakten Head (Release-Gate): eine
 #   Kommentarzeile "Gate-Urteil: GO <voller Head-SHA>". Ein späteres NO-GO am selben Head hebt
 #   ein früheres GO auf und sperrt jeden PR (auch ohne geschützte Pfade) direkt vor dem Freigeben. Prozess-Mauer gegen stilles
 #   Aufweichen durch Agenten, kein Schutz gegen böswillige Schreibrechte (gleiche Identität).

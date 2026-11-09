@@ -1,4 +1,4 @@
-# Freigabe-Tests: volle Testsuite bei JEDEM PR auf main, ohne Pfadfilter (TJ 2026-10-24).
+# Freigabe-Tests: volle Testsuite bei JEDEM PR auf main, ohne Pfadfilter.
 # Läuft unter pull_request (Cache-Bereich des PR-Branches, Lesetoken, keine Secrets).
 # Ihr grüner Check-Run "Volle Testsuite" ist Pflicht-Check auf main und Voraussetzung
 # für die automatische Freigabe (auto-freigabe.yml).
@@ -7,7 +7,8 @@ name: Freigabe-Tests
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # edited: ein nachträglich geänderter PR-Titel oder -Text wird erneut auf Neutralität geprüft.
+    types: [opened, synchronize, reopened, ready_for_review, edited]
     branches: [main]
 
 permissions:
@@ -26,9 +27,17 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, immutable
         with:
           persist-credentials: false
+          fetch-depth: 0 # Basis und Head für die Neutralitätsprüfung
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
+      - name: Öffentliche Texte neutral prüfen
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python scripts/verify_public_neutral.py --base "$BASE_SHA" --head "$HEAD_SHA"
       - name: Minisign für Signatur-Tests
         run: |
           sudo apt-get update
