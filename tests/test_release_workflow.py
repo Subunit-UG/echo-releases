@@ -1269,6 +1269,20 @@ class MacOSAppIconContract(unittest.TestCase):
         self.assertIn("python3 _release-ci/scripts/verify-macos-app-icon.py src-tauri/tauri.conf.json \"$app\"", text)
         self.assertLess(WORKFLOW.index("uses: ./_release-ci/.github/actions/confidential-tauri"), step.start())
         self.assertIn('"scripts/verify-macos-app-icon.py"', CONTRACT_WORKFLOW)
+        probe = re.search(
+            r"(?ms)^      - name: Pinned Xcode verifies a macOS 26 system icon \(same pin as build\.yml\)\n.*?(?=^      - |\Z)",
+            CONTRACT_WORKFLOW,
+        )
+        self.assertIsNotNone(probe)
+        self.assertIn("if: matrix.platform == 'macos-15'", probe.group(0))
+        self.assertIn('DEVELOPER_DIR="$pin/Contents/Developer" python3 scripts/verify-macos-app-icon.py', probe.group(0))
+
+    def test_public_fixture_is_a_real_macos_26_system_icon(self) -> None:
+        fixture = ROOT / "tests" / "fixtures" / "app-icon"
+        car = fixture / "Fixture.app" / "Contents" / "Resources" / "Assets.car"
+        self.assertGreater(car.stat().st_size, 0)
+        if shutil.which("assetutil"):
+            self.assertIn("'fixture'", self.verifier.verify(fixture / "tauri.conf.json", fixture / "Fixture.app"))
 
     def test_complete_system_icon_is_accepted(self) -> None:
         message = self.verifier.verify(self.conf, self.app, self.assetutil)
