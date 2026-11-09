@@ -14,6 +14,8 @@ on:
       - "scripts/verify-updater-signatures.py"
       - "scripts/upload-release-asset.py"
       - "scripts/validate-macos-app-archive.py"
+      - "scripts/verify-macos-app-icon.py"
+      - "tests/fixtures/app-icon/**"
       - "scripts/verify-platform-macos.sh"
       - "scripts/verify-platform-windows.ps1"
       - "tests/test_release_workflow.py"
@@ -37,6 +39,8 @@ on:
       - "scripts/verify-updater-signatures.py"
       - "scripts/upload-release-asset.py"
       - "scripts/validate-macos-app-archive.py"
+      - "scripts/verify-macos-app-icon.py"
+      - "tests/fixtures/app-icon/**"
       - "scripts/verify-platform-macos.sh"
       - "scripts/verify-platform-windows.ps1"
       - "tests/test_release_workflow.py"
@@ -96,6 +100,17 @@ jobs:
           ls -d /Applications/Xcode*.app
           [ -d "$pin" ] || { echo "::error::$pin fehlt im Runner-Image macos-15"; exit 1; }
           DEVELOPER_DIR="$pin/Contents/Developer" xcodebuild -version
+      - name: Pinned Xcode verifies a macOS 26 system icon (same pin as build.yml)
+        # The release build checks Assets.car with the pinned toolchain's assetutil. This probe
+        # proves on the same runner image that it can read a car compiled for macOS 26.
+        if: matrix.platform == 'macos-15'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin=$(sed -n 's|^ *xcode_app=\(/Applications/Xcode_[0-9.]*\.app\)$|\1|p' .github/workflows/build.yml)
+          [ -n "$pin" ] || { echo "::error::Xcode-Pin in build.yml nicht gefunden"; exit 1; }
+          DEVELOPER_DIR="$pin/Contents/Developer" python3 scripts/verify-macos-app-icon.py \
+            tests/fixtures/app-icon/tauri.conf.json tests/fixtures/app-icon/Fixture.app
       - name: Prepare public fixture
         shell: bash
         run: node tests/fixtures/confidential-hosted/probe.cjs prepare

@@ -763,6 +763,19 @@ jobs:
           prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
           args: ${{ matrix.args }}${{ steps.windows-signing.outputs.args && format(' {0}', steps.windows-signing.outputs.args) || '' }}
 
+      # Since macOS 26 the app icon ships as Contents/Resources/Assets.car plus
+      # CFBundleIconName. Tauri skips that step with only a log line when the
+      # toolchain cannot produce it, and the app silently shows the legacy icon.
+      - name: Verify macOS app icon (Assets.car and CFBundleIconName)
+        if: matrix.platform == 'macos-15'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=src-tauri/target/aarch64-apple-darwin/release/bundle
+          app=$(find "$root/macos" -maxdepth 1 -name '*.app' -print -quit)
+          test -n "$app" || { echo "::error::no .app bundle found"; exit 1; }
+          python3 _release-ci/scripts/verify-macos-app-icon.py src-tauri/tauri.conf.json "$app"
+
       - name: Verify enabled Windows signing before release gates
         if: runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' || vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')
         shell: pwsh
