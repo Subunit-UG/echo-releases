@@ -1,4 +1,4 @@
-# Nachlauf der automatischen Freigabe: grün darf nie an einem Neustart hängen (TJ 2026-10-24).
+# Nachlauf der automatischen Freigabe: grün darf nie an einem Neustart hängen.
 #
 # Stößt eine fehlgeschlagene oder abgebrochene "Automatische Freigabe" am aktuellen Head neu an,
 # - sobald ein PR-Workflow dort grün durchgelaufen ist (z. B. nach einem Neustart eines

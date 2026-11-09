@@ -283,7 +283,7 @@ jobs:
     # Umgebung `release-signing`, deren Deployment-Regel nur `main` zulässt. Ein
     # Workflow auf einem anderen Zweig (auch per push eines Schreibberechtigten)
     # bekommt sie dadurch nicht, die Apple-vertraute Identität bleibt im
-    # geprüften Release-Weg (TJ 04.11.2026: Echo für Mac notarisieren).
+    # geprüften Release-Weg (seit 04.11.2026 wird Echo für Mac notarisiert).
     environment: release-signing
     permissions:
       contents: write
