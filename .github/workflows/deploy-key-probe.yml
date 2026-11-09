@@ -1,0 +1,33 @@
+# Deploy-key probe: the release build, the release poller and the PR check read the private source repository with the
+# read-only deploy key in ECHO_TAURI_DEPLOY_KEY. A key that disappears from the source repository would otherwise show
+# up only at the next release. Daily (and on demand) this run checks that the key can still read the repository
+# (git ls-remote). Output is PASS/FAIL only, never refs or key material.
+
+name: Deploy-key probe
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-key-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: Read access per deploy key
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out public probe tools
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, immutable
+        with:
+          persist-credentials: false
+      - name: ECHO_TAURI_DEPLOY_KEY → Subunit-UG/echo-app
+        env:
+          SOURCE_DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
+        run: bash scripts/probe-deploy-key.sh ECHO_TAURI_DEPLOY_KEY Subunit-UG/echo-app
