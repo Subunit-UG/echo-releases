@@ -4,6 +4,7 @@ Jeder Fall baut ein Wegwerf-Repo mit Basis- und Head-Commit und ruft das Skript 
 Interne Wendungen in den Testdaten werden aus Teilen zusammengesetzt ("T" "J ..."), damit diese
 Datei die Prüfung im eigenen PR nicht auslöst.
 """
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -18,7 +19,8 @@ ZITAT = "T" "J 2026-10-24"
 ZITAT_KURZ = "(T" "J 04.11.2026)"
 REGELWERK = "Ca" "non Release-Gate"
 WISSEN = "~/sub" "unit/u1" "-brain/workspace/" "starts/x.md"
-GERAET = "tomsync" "@MacBook" "-Pro-von-Tom.fritz" ".box"
+GERAET = "tom" "sync" "@MacBook" "-Pro-von-Tom.fritz" ".box"
+MAC_PFAD = "/Use" "rs/tom" "sync/subunit/x/scripts/a.py"
 NEUTRAL = "Kanonische Pfade, Canonical URL, TJ als Kürzel, workspace/foo und handoff-frei."
 
 
@@ -38,7 +40,7 @@ class Repo:
 
     def schreiben(self, name, inhalt):
         (self.pfad / name).parent.mkdir(parents=True, exist_ok=True)
-        (self.pfad / name).write_text(inhalt, encoding="utf-8")
+        (self.pfad / name).write_bytes(inhalt if isinstance(inhalt, bytes) else inhalt.encode("utf-8"))
         self.git("add", "-A")
 
     def commit(self, nachricht, env=None):
@@ -104,6 +106,34 @@ class NeutralTest(unittest.TestCase):
         self.r.schreiben("prüfung.md", "# " + WISSEN + "\n")
         self.assertFund(self.r.pruefen(self.r.commit("x")), "prüfung.md:1")
 
+    def test_benutzername_allein_als_adresse(self):
+        nutzer = {"GIT_AUTHOR_EMAIL": "tom" "sync@localhost", "GIT_COMMITTER_EMAIL": "tom" "sync@localhost"}
+        self.assertFund(self.r.pruefen(self.r.commit("x", env=nutzer)), "Adresse")
+
+    def test_mac_pfad_in_neuer_zeile(self):
+        self.r.schreiben("c.txt", "pfad: " + MAC_PFAD + "\n")
+        self.assertFund(self.r.pruefen(self.r.commit("x")), "c.txt:1")
+
+    def test_fremder_mac_pfad_in_neuer_zeile(self):
+        self.r.schreiben("e.txt", "pfad: /Use" "rs/jemand/projekt/a.py\n")
+        self.assertFund(self.r.pruefen(self.r.commit("x")), "e.txt:1")
+
+    def test_runner_pfad_ist_erlaubt(self):
+        self.r.schreiben("d.yml", "cache: /Users/runner/work/_temp\n")
+        p = self.r.pruefen(self.r.commit("ci: d"))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_zeilentrenner_verstecken_nichts(self):
+        for i, trenner in enumerate(("\x1c", "\x85", "\u2028", "\x0b", "\r")):
+            with self.subTest(trenner=repr(trenner)):
+                name = f"t{i}.txt"
+                self.r.schreiben(name, "a" + trenner + ZITAT + "\n")
+                self.assertFund(self.r.pruefen(self.r.commit("x")), name + ":1")
+
+    def test_binaerdatei_wird_geprueft(self):
+        self.r.schreiben("cache.pyc", b"\x00\x01\xe3" + MAC_PFAD.encode() + b"\x00" + GERAET.encode() + b"\x00")
+        self.assertFund(self.r.pruefen(self.r.commit("x")), "cache.pyc:1")
+
     def test_geloeschte_zeile_zaehlt_nicht(self):
         self.r.schreiben("README.md", "Start\n")
         p = self.r.pruefen(self.r.commit("chore: bereinigt"))
@@ -115,6 +145,15 @@ class NeutralTest(unittest.TestCase):
         self.r.git("add", "-A")
         p = self.r.pruefen(self.r.commit("ci: Prüfung"))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_unerwartete_hunkzeile_bricht_ab(self):
+        spec = importlib.util.spec_from_file_location("vpn_unter_test", SKRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        diff = "diff --git a/x b/x\n+++ b/x\n@@ -0,0 +1,2 @@\n+erste\nohne Plus\n+zweite\n"
+        mod.git = lambda *args: diff if "diff" in args else ""
+        with self.assertRaises(subprocess.CalledProcessError):
+            mod.pruefen("a", "b")
 
     def test_git_fehler_ist_fail_closed(self):
         p = self.r.pruefen("0" * 40)

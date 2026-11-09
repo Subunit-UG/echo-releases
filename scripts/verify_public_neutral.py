@@ -23,7 +23,7 @@ MUSTER = [
     ("internes Zitat", re.compile(r"“\s*\(TJ\b")),
     ("internes Regelwerk", re.compile(r"\bC[a]non\b|\bS[I]CHERHEITSPROGRAMM\b|\bincidents\/20\d\d")),
     ("internes Wissenssystem", re.compile(r"\bu1[-]brain\b|~\/subunit\/|\bworkspace\/(?:docs|starts|handoffs|scripts|memory|config)\/|\bhandoffs\/")),
-    ("Gerätename oder Heimnetz", re.compile(r"fritz\.box|MacBook[-]Pro|\btomsync[@]")),
+    ("Gerätename oder Heimnetz", re.compile(r"fritz\.box|MacBook[-]Pro|\btom[s]ync\b|\/User[s]\/(?!runner\/)[\w.-]+")),
 ]
 
 
@@ -38,8 +38,8 @@ def funde(text):
 
 
 def git(*args):
-    return subprocess.run(["git", *args], check=True, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace").stdout
+    # Bytes statt Textmodus: der Textmodus macht aus einem einzelnen "\r" einen Zeilenumbruch.
+    return subprocess.run(["git", *args], check=True, capture_output=True).stdout.decode("utf-8", "replace")
 
 
 def pruefen(base, head):
@@ -57,11 +57,12 @@ def pruefen(base, head):
             meldungen.append(f"Commit {sha[:12]} Nachricht Zeile {nr}: {art} ({treffer})")
 
     # Hunk-Köpfe geben die Zahl der neuen Zeilen vor; nur so wird eine hinzugefügte Zeile, die
-    # selbst mit "++ " beginnt, nicht als Dateikopf gelesen.
+    # selbst mit "++ " beginnt, nicht als Dateikopf gelesen. Getrennt wird nur an "\n" wie bei git:
+    # splitlines() trennt auch an \x1c, \x85 oder U+2028, und der Rest einer Zeile bliebe ungeprüft.
     diff = git("-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0",
                "--text", f"{base}...{head}")
     datei, zeile, rest = "?", 0, 0
-    for z in diff.splitlines():
+    for z in diff.split("\n"):
         if rest > 0:
             if z.startswith("+"):
                 for _, art, treffer in funde(z[1:]):
@@ -69,6 +70,8 @@ def pruefen(base, head):
                     print(f"::error file={datei},line={zeile}::{art}: bitte neutral formulieren")
                 zeile += 1
                 rest -= 1
+            elif not z.startswith(("-", "\\")):
+                raise subprocess.CalledProcessError(1, "git diff", stderr=f"unerwartete Zeile im Hunk: {z[:80]}")
             continue
         if z.startswith("+++ "):
             datei = z[4:].strip('"')
@@ -89,7 +92,8 @@ def main():
     try:
         meldungen = pruefen(a.base, a.head)
     except subprocess.CalledProcessError as e:
-        print(f"::error::Git-Fehler, Prüfung nicht möglich: {(e.stderr or '').strip()[:300]}")
+        fehler = e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        print(f"::error::Git-Fehler, Prüfung nicht möglich: {fehler.strip()[:300]}")
         return 2
     if meldungen:
         print("Öffentliches Repo: interne Wendungen gefunden (neutral formulieren, Zitate und interne Pfade weglassen):")
