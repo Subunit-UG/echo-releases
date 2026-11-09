@@ -1213,5 +1213,95 @@ class MacOSRunnerContract(unittest.TestCase):
                 self.assertNotEqual(macos_runner_errors({**self.texts, name: mutated}), [])
 
 
+
+MACOS_ICON_VERIFIER = ROOT / "scripts" / "verify-macos-app-icon.py"
+
+
+def load_icon_verifier():
+    spec = importlib.util.spec_from_file_location("verify_macos_app_icon", MACOS_ICON_VERIFIER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class MacOSAppIconContract(unittest.TestCase):
+    """A declared system icon (Assets.car) must reach the built app, never silently fall back."""
+
+    def setUp(self) -> None:
+        self.verifier = load_icon_verifier()
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.conf = self.tmp / "tauri.conf.json"
+        self.app = self.tmp / "Echo.app"
+        resources = self.app / "Contents" / "Resources"
+        resources.mkdir(parents=True)
+        (resources / "Assets.car").write_bytes(b"car")
+        (resources / "icon.icns").write_bytes(b"icns")
+        self.write_info({"CFBundleIconName": "echo", "CFBundleIconFile": "icon.icns"})
+        self.write_conf(["icons/32x32.png", "icons/icon.icns", "icons/Assets.car", "icons/icon.ico"])
+        self.assetutil = self.fake_assetutil([{"AssetType": "Icon Image", "Name": "echo"}])
+
+    def write_conf(self, icons: list[str]) -> None:
+        self.conf.write_text(json.dumps({"bundle": {"icon": icons}}), encoding="utf-8")
+
+    def write_info(self, info: dict) -> None:
+        import plistlib
+        with (self.app / "Contents" / "Info.plist").open("wb") as handle:
+            plistlib.dump(info, handle)
+
+    def fake_assetutil(self, entries: list[dict], code: int = 0) -> str:
+        path = self.tmp / f"assetutil-{len(list(self.tmp.glob('assetutil-*')))}"
+        payload = json.dumps([{"AssetStorageVersion": "fixture"}, *entries])
+        path.write_text(f"#!/bin/sh\ncat <<'JSON'\n{payload}\nJSON\nexit {code}\n", encoding="utf-8")
+        path.chmod(0o755)
+        return str(path)
+
+    def test_build_step_runs_on_every_macos_build_after_bundling(self) -> None:
+        step = re.search(
+            r"(?ms)^      - name: Verify macOS app icon \(Assets\.car and CFBundleIconName\)\n.*?(?=^      - |\Z)",
+            WORKFLOW,
+        )
+        self.assertIsNotNone(step)
+        text = step.group(0)
+        self.assertIn("        if: matrix.platform == 'macos-15'\n", text)
+        self.assertNotIn("vars.", text)
+        self.assertIn("python3 _release-ci/scripts/verify-macos-app-icon.py src-tauri/tauri.conf.json \"$app\"", text)
+        self.assertLess(WORKFLOW.index("uses: ./_release-ci/.github/actions/confidential-tauri"), step.start())
+        self.assertIn('"scripts/verify-macos-app-icon.py"', CONTRACT_WORKFLOW)
+
+    def test_complete_system_icon_is_accepted(self) -> None:
+        message = self.verifier.verify(self.conf, self.app, self.assetutil)
+        self.assertIn("'echo'", message)
+
+    def test_source_without_system_icon_keeps_building(self) -> None:
+        self.write_conf(["icons/32x32.png", "icons/icon.icns"])
+        (self.app / "Contents" / "Resources" / "Assets.car").unlink()
+        self.assertIn("legacy icon only", self.verifier.verify(self.conf, self.app, self.assetutil))
+
+    def test_each_silent_fallback_fails_closed(self) -> None:
+        resources = lambda: self.app / "Contents" / "Resources"  # noqa: E731 - setUp below makes a fresh app
+        cases = {
+            "car missing": lambda: (resources() / "Assets.car").unlink(),
+            "icon name missing": lambda: self.write_info({"CFBundleIconFile": "icon.icns"}),
+            "fallback missing": lambda: (resources() / "icon.icns").unlink(),
+            "name not in car": lambda: setattr(self, "assetutil", self.fake_assetutil([{"AssetType": "Icon Image", "Name": "other"}])),
+            "assetutil fails": lambda: setattr(self, "assetutil", self.fake_assetutil([], code=1)),
+            "assetutil absent": lambda: setattr(self, "assetutil", str(self.tmp / "missing-assetutil")),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                self.setUp()
+                mutate()
+                with self.assertRaises(self.verifier.IconError):
+                    self.verifier.verify(self.conf, self.app, self.assetutil)
+
+    def test_declared_icon_source_is_also_checked(self) -> None:
+        self.write_conf(["icons/icon.icns", "icons/Echo.icon"])
+        (self.app / "Contents" / "Resources" / "Assets.car").unlink()
+        with self.assertRaises(self.verifier.IconError):
+            self.verifier.verify(self.conf, self.app, self.assetutil)
+
+
 if __name__ == "__main__":
     unittest.main()
