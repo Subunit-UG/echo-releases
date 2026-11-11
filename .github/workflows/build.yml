@@ -276,71 +276,36 @@ jobs:
           fi
           echo "release_id=$id" >> "$GITHUB_OUTPUT"
 
-  build:
+  build_unsigned:
     needs: [prepare, reserve]
     if: needs.prepare.outputs.should_build == 'true'
-    # Developer-ID-Zertifikat und Notarisierungsschlüssel liegen als Secrets der
-    # Umgebung `release-signing`, deren Deployment-Regel nur `main` zulässt. Ein
-    # Workflow auf einem anderen Zweig (auch per push eines Schreibberechtigten)
-    # bekommt sie dadurch nicht, die Apple-vertraute Identität bleibt im
-    # geprüften Release-Weg (seit 04.11.2026 wird Echo für Mac notarisiert).
-    environment: release-signing
+    # Private source and npm lifecycle code run only in this unprivileged phase.
+    # Signing, OIDC and release-write authority live on fresh runners below.
     permissions:
-      contents: write
-      id-token: write # Tauri signs during bundling; no OIDC access in publish/verification jobs.
-    env:
-      WINDOWS_SIGNING_BACKEND: ${{ vars.WINDOWS_SIGNING_BACKEND || 'none' }}
-      WINDOWS_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER }}
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: ubuntu-24.04
+            artifact: linux-x64
+            target_dir: src-tauri/target/release
             args: "--features local-whisper-gpu"
           - platform: windows-latest
+            artifact: windows-x64
+            target_dir: src-tauri/target/release
             args: "--features local-whisper-gpu"
           - platform: windows-11-arm
+            artifact: windows-arm64
+            target_dir: src-tauri/target/release
             args: "--features local-whisper"
           - platform: macos-15
+            artifact: macos-arm64
+            target_dir: src-tauri/target/aarch64-apple-darwin/release
             args: "--target aarch64-apple-darwin --features local-whisper"
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - name: Validate Windows signing backend
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          switch -CaseSensitive ($env:WINDOWS_SIGNING_BACKEND) {
-            'none' { }
-            'artifact-signing' { }
-            'azure-key-vault' { }
-            default { throw 'Unknown WINDOWS_SIGNING_BACKEND' }
-          }
-
-      - name: Validate Windows cloud signing settings
-        if: runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' || vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')
-        shell: pwsh
-        env:
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
-          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
-          ARTIFACT_SIGNING_CERTIFICATE_PROFILE: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
-          AZURE_KEY_VAULT_CERTIFICATE_URL: ${{ vars.AZURE_KEY_VAULT_CERTIFICATE_URL }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          switch -CaseSensitive ($env:WINDOWS_SIGNING_BACKEND) {
-            'artifact-signing' { $settings = @('ARTIFACT_SIGNING_ENDPOINT', 'ARTIFACT_SIGNING_ACCOUNT', 'ARTIFACT_SIGNING_CERTIFICATE_PROFILE') }
-            'azure-key-vault' { $settings = @('AZURE_KEY_VAULT_CERTIFICATE_URL') }
-            default { throw 'Unknown WINDOWS_SIGNING_BACKEND' }
-          }
-          $settings += @('AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SUBSCRIPTION_ID', 'WINDOWS_PUBLISHER')
-          foreach ($name in $settings) {
-            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Missing signing setting: $name" }
-          }
-
       # Privaten Quellcode (echo-tauri@ref) auschecken — MANUELLER git clone per
       # read-only Deploy-Key, NICHT actions/checkout mit ssh-key: dessen SSH-Handling
       # bricht auf windows-11-arm (Permission denied publickey). Der manuelle Weg
@@ -377,7 +342,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for path in _release-ci _release-tauri; do
+          for path in _release-ci; do
             if [ -e "$path" ] || [ -L "$path" ]; then
               echo "::error::reserved CI path already exists"; exit 1
             fi
@@ -389,14 +354,6 @@ jobs:
           repository: ${{ github.repository }}
           ref: ${{ github.sha }}
           path: _release-ci
-          persist-credentials: false
-
-      - name: Checkout pinned upstream Tauri action
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          repository: tauri-apps/tauri-action
-          ref: 84b9d35b5fc46c1e45415bdb6144030364f7ebc5
-          path: _release-tauri
           persist-credentials: false
 
       - name: Install Linux deps
@@ -573,6 +530,366 @@ jobs:
       - shell: bash
         run: bash _release-ci/scripts/run-confidential.sh npm ci
 
+      - name: Compile private source without bundling or signing
+        shell: bash
+        run: bash _release-ci/scripts/run-confidential.sh npm run tauri build -- --no-bundle ${{ matrix.args }}
+
+      - name: Stage bundle-only input without private source
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET_DIR: ${{ matrix.target_dir }}
+          HANDOFF_ROOT: ${{ runner.temp }}/echo-handoff-${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          bash _release-ci/scripts/run-confidential.sh node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const workspace = fs.realpathSync(process.cwd());
+          const handoff = path.resolve(process.env.HANDOFF_ROOT);
+          const root = path.join(handoff, 'bundle-input');
+          const tauriSource = path.join(workspace, 'src-tauri');
+          const tauriTarget = path.join(root, 'src-tauri');
+          fs.mkdirSync(tauriTarget, { recursive: true, mode: 0o700 });
+
+          const within = (base, candidate) => candidate === base || candidate.startsWith(base + path.sep);
+          const destinationFor = (source) => {
+            const resolved = path.resolve(source);
+            if (!within(workspace, resolved)) throw new Error('bundle input escapes private workspace');
+            return path.join(root, path.relative(workspace, resolved));
+          };
+          const copyEntry = (source) => {
+            const resolved = path.resolve(source);
+            if (!within(workspace, resolved) || !fs.existsSync(resolved)) return false;
+            const stat = fs.lstatSync(resolved);
+            const destination = destinationFor(resolved);
+            fs.mkdirSync(path.dirname(destination), { recursive: true });
+            if (stat.isSymbolicLink()) {
+              const target = fs.readlinkSync(resolved);
+              if (path.isAbsolute(target)) throw new Error('absolute bundle symlink rejected');
+              const finalTarget = fs.realpathSync(path.resolve(path.dirname(resolved), target));
+              if (!within(workspace, finalTarget)) throw new Error('escaping bundle symlink rejected');
+              fs.symlinkSync(target, destination, fs.statSync(finalTarget).isDirectory() ? 'dir' : 'file');
+            } else if (stat.isDirectory()) {
+              fs.mkdirSync(destination, { recursive: true });
+              for (const name of fs.readdirSync(resolved)) copyEntry(path.join(resolved, name));
+            } else if (stat.isFile()) {
+              fs.copyFileSync(resolved, destination);
+              fs.chmodSync(destination, stat.mode & 0o777);
+            } else {
+              throw new Error('unsupported bundle input type');
+            }
+            return true;
+          };
+          const copySpec = (raw) => {
+            if (typeof raw !== 'string' || !raw || /^[a-z]+:\/\//i.test(raw)) return;
+            if (path.isAbsolute(raw) || /^[A-Za-z]:[\\/]/.test(raw)) throw new Error('absolute bundle path rejected');
+            const wildcard = raw.search(/[?*[{]/);
+            const relative = wildcard === -1 ? raw : raw.slice(0, wildcard);
+            let source = path.resolve(tauriSource, relative || '.');
+            if (wildcard !== -1 && fs.existsSync(source) && !fs.lstatSync(source).isDirectory()) source = path.dirname(source);
+            if (copyEntry(source)) return;
+            const directory = path.dirname(source);
+            const prefix = path.basename(source);
+            if (fs.existsSync(directory)) {
+              for (const name of fs.readdirSync(directory)) {
+                if (name.startsWith(prefix + '-')) copyEntry(path.join(directory, name));
+              }
+            }
+          };
+          const values = (value) => Array.isArray(value) ? value : value && typeof value === 'object' ? Object.keys(value) : [value];
+          const copyValues = (value) => values(value).forEach(copySpec);
+
+          const configNames = fs.readdirSync(tauriSource).filter((name) => /^tauri(?:\.[a-z]+)?\.conf\.json$/.test(name));
+          if (!configNames.includes('tauri.conf.json')) throw new Error('tauri.conf.json missing');
+          let primary;
+          for (const name of configNames) {
+            const source = path.join(tauriSource, name);
+            const config = JSON.parse(fs.readFileSync(source, 'utf8'));
+            if (name === 'tauri.conf.json') primary = config;
+            copyEntry(source);
+            const bundle = config.bundle || {};
+            copyValues(bundle.icon);
+            copyValues(bundle.resources);
+            copyValues(bundle.externalBin);
+            copySpec(bundle.licenseFile);
+            const mac = bundle.macOS || bundle.macos || {};
+            copySpec(mac.entitlements); copySpec(mac.infoPlist);
+            copyValues(mac.frameworks); copyValues(mac.files);
+            const dmg = mac.dmg || {};
+            copySpec(dmg.background); copySpec(dmg.windowBackground);
+            const windows = bundle.windows || {};
+            copySpec(windows.iconPath);
+            if (windows.webviewInstallMode) copySpec(windows.webviewInstallMode.path);
+            const nsis = windows.nsis || {};
+            copySpec(nsis.installerIcon); copySpec(nsis.headerImage); copySpec(nsis.sidebarImage);
+            const linux = bundle.linux || {};
+            if (linux.appimage) copyValues(linux.appimage.files);
+          }
+          for (const conventional of ['icons', 'resources']) copyEntry(path.join(tauriSource, conventional));
+
+          const version = process.env.TAG.slice(1);
+          const binary = primary.mainBinaryName || 'echo';
+          if (!/^[A-Za-z0-9_.-]+$/.test(binary) || !/^[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?$/.test(version)) {
+            throw new Error('invalid bundle identity');
+          }
+          const manifest = `[package]\nname = ${JSON.stringify(binary)}\nversion = ${JSON.stringify(version)}\nedition = "2021"\ndefault-run = ${JSON.stringify(binary)}\n\n[[bin]]\nname = ${JSON.stringify(binary)}\npath = "src/main.rs"\n\n[dependencies]\ntauri = "2"\n`;
+          fs.writeFileSync(path.join(tauriTarget, 'Cargo.toml'), manifest, { mode: 0o600 });
+          fs.mkdirSync(path.join(tauriTarget, 'src'), { recursive: true });
+          fs.writeFileSync(path.join(tauriTarget, 'src/main.rs'), 'fn main() {}\n', { mode: 0o600 });
+
+          const targetSource = path.resolve(workspace, process.env.TARGET_DIR);
+          const targetDestination = path.resolve(root, process.env.TARGET_DIR);
+          if (!within(workspace, targetSource) || !fs.existsSync(targetSource)) throw new Error('compiled target directory missing');
+          fs.mkdirSync(targetDestination, { recursive: true });
+          const executable = process.platform === 'win32' ? `${binary}.exe` : binary;
+          if (!copyEntry(path.join(targetSource, executable))) throw new Error('compiled application binary missing');
+          for (const name of fs.readdirSync(targetSource)) {
+            if (name === executable || /\.(?:d|pdb|rlib|rmeta)$/i.test(name)) continue;
+            const candidate = path.join(targetSource, name);
+            const stat = fs.lstatSync(candidate);
+            if (stat.isFile() && (/\.(?:exe|dll|dylib|so)$/i.test(name) || (stat.mode & 0o111))) copyEntry(candidate);
+          }
+          fs.writeFileSync(path.join(root, 'handoff-metadata.json'), JSON.stringify({
+            schema: 1, artifact: process.env.ARTIFACT, source_commit: process.env.SOURCE_COMMIT,
+            tag: process.env.TAG, binary, target_dir: process.env.TARGET_DIR
+          }) + '\n', { mode: 0o600 });
+          NODE
+          archive="$RUNNER_TEMP/unsigned-${{ matrix.artifact }}.tar.gz"
+          tar -czf "$archive" -C "$HANDOFF_ROOT" bundle-input
+          test -s "$archive"
+
+      - name: Upload immutable unsigned platform input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/unsigned-${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  bind_unsigned_artifacts:
+    needs: [prepare, build_unsigned]
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.bind.outputs.artifact-id }}
+      artifact_digest: ${{ steps.bind.outputs.artifact-digest }}
+    steps:
+      - name: Download the four immutable build artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: unsigned-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: ${{ runner.temp }}/unsigned
+          merge-multiple: true
+      - name: Bind exact platform bytes into one manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/unsigned"
+          expected=(linux-x64 windows-x64 windows-arm64 macos-arm64)
+          [ "$(find . -maxdepth 1 -type f -name 'unsigned-*.tar.gz' | wc -l | tr -d ' ')" -eq 4 ] \
+            || { echo "::error::expected four unsigned platform archives"; exit 1; }
+          : > MANIFEST.sha256
+          for platform in "${expected[@]}"; do
+            file="unsigned-$platform.tar.gz"
+            [ -s "$file" ] || { echo "::error::missing $file"; exit 1; }
+            sha256sum "$file" >> MANIFEST.sha256
+          done
+          sha256sum -c MANIFEST.sha256
+      - id: bind
+        name: Upload digest-bound release handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bound-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/unsigned/MANIFEST.sha256
+            ${{ runner.temp }}/unsigned/unsigned-linux-x64.tar.gz
+            ${{ runner.temp }}/unsigned/unsigned-windows-x64.tar.gz
+            ${{ runner.temp }}/unsigned/unsigned-windows-arm64.tar.gz
+            ${{ runner.temp }}/unsigned/unsigned-macos-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    needs: [prepare, reserve, bind_unsigned_artifacts]
+    if: needs.prepare.outputs.should_build == 'true'
+    environment: release-signing
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    env:
+      WINDOWS_SIGNING_BACKEND: ${{ vars.WINDOWS_SIGNING_BACKEND || 'none' }}
+      WINDOWS_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: linux-x64
+            target_dir: src-tauri/target/release
+            bundles: appimage
+            args: "--features local-whisper-gpu"
+          - runner: windows-latest
+            artifact: windows-x64
+            target_dir: src-tauri/target/release
+            bundles: nsis
+            args: "--features local-whisper-gpu"
+          - runner: windows-11-arm
+            artifact: windows-arm64
+            target_dir: src-tauri/target/release
+            bundles: nsis
+            args: "--features local-whisper"
+          - runner: macos-15
+            artifact: macos-arm64
+            target_dir: src-tauri/target/aarch64-apple-darwin/release
+            bundles: app,dmg
+            args: "--target aarch64-apple-darwin --features local-whisper"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout trusted public CI controls on the fresh runner
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: _release-ci
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.runner == 'macos-15' && 'aarch64-apple-darwin' || '' }}
+
+      - name: Install trusted bundling prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.runner }}" = ubuntu-24.04 ]; then
+            sudo apt-get update
+            sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+              librsvg2-dev libayatana-appindicator3-dev patchelf
+          elif [ "${{ matrix.runner }}" = macos-15 ]; then
+            xcode_app=/Applications/Xcode_16.4.app
+            [ -d "$xcode_app" ] || { echo "::error::$xcode_app missing"; exit 1; }
+            sudo xcode-select -s "$xcode_app/Contents/Developer"
+          fi
+          tools="$RUNNER_TEMP/trusted-tauri-cli"
+          mkdir -p "$tools"
+          cd "$tools"
+          bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" npm init -y
+          bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" npm install \
+            --ignore-scripts --no-audit --no-fund --save-exact @tauri-apps/cli@2.10.1
+          echo "TAURI_CLI=$tools/node_modules/.bin/tauri" >> "$GITHUB_ENV"
+
+      - name: Download exact handoff ID and verify GitHub artifact digest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_ID: ${{ needs.bind_unsigned_artifacts.outputs.artifact_id }}
+          EXPECTED_DIGEST: ${{ needs.bind_unsigned_artifacts.outputs.artifact_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || { echo "::error::invalid handoff artifact id"; exit 1; }
+          [[ "$EXPECTED_DIGEST" =~ ^(sha256:)?[0-9a-f]{64}$ ]] || { echo "::error::invalid handoff digest"; exit 1; }
+          archive="$RUNNER_TEMP/bound-handoff.zip"
+          gh api "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip" > "$archive"
+          actual="$(sha256sum "$archive" | awk '{print $1}')"
+          [ "$actual" = "${EXPECTED_DIGEST#sha256:}" ] || { echo "::error::handoff digest mismatch"; exit 1; }
+          mkdir "$RUNNER_TEMP/bound-handoff"
+          python - "$archive" "$RUNNER_TEMP/bound-handoff" <<'PY'
+          import pathlib, stat, sys, zipfile
+          archive, destination = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as source:
+              members = source.infolist()
+              if not members:
+                  raise SystemExit('empty handoff')
+              for member in members:
+                  path = pathlib.PurePosixPath(member.filename)
+                  mode = member.external_attr >> 16
+                  if path.is_absolute() or '..' in path.parts or stat.S_ISLNK(mode):
+                      raise SystemExit('unsafe handoff member')
+              source.extractall(destination)
+          PY
+          cd "$RUNNER_TEMP/bound-handoff"
+          sha256sum -c MANIFEST.sha256
+          platform_archive="unsigned-${{ matrix.artifact }}.tar.gz"
+          python "$GITHUB_WORKSPACE/_release-ci/scripts/validate-macos-app-archive.py" \
+            "$platform_archive" "$RUNNER_TEMP/platform-handoff"
+
+      - name: Verify handoff identity and write fail-closed bundle policy
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TRUSTED_SIGN_SCRIPT: ${{ github.workspace }}/_release-ci/scripts/sign-windows.ps1
+        run: |
+          set -euo pipefail
+          bundle_root="$RUNNER_TEMP/platform-handoff/bundle-input"
+          python - "$bundle_root/handoff-metadata.json" <<'PY'
+          import json, os, pathlib, sys
+          metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          expected = {'schema': 1, 'artifact': os.environ['ARTIFACT'],
+                      'source_commit': os.environ['SOURCE_COMMIT'], 'tag': os.environ['TAG']}
+          if any(metadata.get(key) != value for key, value in expected.items()):
+              raise SystemExit('handoff identity mismatch')
+          PY
+          export TRUSTED_BUNDLE_POLICY="$RUNNER_TEMP/trusted-bundle-policy.json"
+          python - <<'PY'
+          import json, os, pathlib
+          windows = {
+              'certificateThumbprint': None,
+              'nsis': {'template': None, 'installerHooks': None, 'customLanguageFiles': {}}
+          }
+          if os.environ.get('WINDOWS_SIGNING_BACKEND') != 'none':
+              windows['signCommand'] = {
+                  'cmd': 'pwsh',
+                  'args': ['-NoProfile', '-NonInteractive', '-File', os.environ['TRUSTED_SIGN_SCRIPT'], '%1']
+              }
+          policy = {
+              'build': {'beforeBuildCommand': None, 'beforeDevCommand': None, 'beforeBundleCommand': None},
+              'bundle': {
+                  'createUpdaterArtifacts': True,
+                  'windows': windows
+              }
+          }
+          pathlib.Path(os.environ['TRUSTED_BUNDLE_POLICY']).write_text(json.dumps(policy), encoding='utf-8')
+          PY
+          echo "BUNDLE_ROOT=$bundle_root" >> "$GITHUB_ENV"
+          echo "TRUSTED_BUNDLE_POLICY=$TRUSTED_BUNDLE_POLICY" >> "$GITHUB_ENV"
+
+      - name: Validate Windows signing backend and settings
+        if: runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' || vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_CERTIFICATE_PROFILE: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+          AZURE_KEY_VAULT_CERTIFICATE_URL: ${{ vars.AZURE_KEY_VAULT_CERTIFICATE_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          switch -CaseSensitive ($env:WINDOWS_SIGNING_BACKEND) {
+            'artifact-signing' { $settings = @('ARTIFACT_SIGNING_ENDPOINT', 'ARTIFACT_SIGNING_ACCOUNT', 'ARTIFACT_SIGNING_CERTIFICATE_PROFILE') }
+            'azure-key-vault' { $settings = @('AZURE_KEY_VAULT_CERTIFICATE_URL') }
+            default { throw 'Cloud signing is required in the privileged phase' }
+          }
+          $settings += @('AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SUBSCRIPTION_ID', 'WINDOWS_PUBLISHER')
+          foreach ($name in $settings) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Missing signing setting: $name" }
+          }
+
       - name: Azure OIDC login for Windows signing
         if: runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' || vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')
         uses: azure/login@8216e11d8cd9b42fe925c852af8e76311ff067ac # v2, immutable
@@ -584,7 +901,6 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Prepare Windows cloud signing
-        id: windows-signing
         if: runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' || vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')
         shell: pwsh
         env:
@@ -594,7 +910,6 @@ jobs:
           ARTIFACT_SIGNING_CERTIFICATE_PROFILE: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_PUBLISHER)) { throw 'WINDOWS_PUBLISHER is required for cloud signing' }
           $signing = Join-Path $env:RUNNER_TEMP 'windows-signing'
           New-Item -ItemType Directory -Path $signing | Out-Null
           $configPath = Join-Path $signing 'provider.json'
@@ -605,16 +920,11 @@ jobs:
               if ((Get-FileHash $relic -Algorithm SHA256).Hash.ToLowerInvariant() -ne '1411ca46a792483f200b744df9fba20bb32179d831f77264d8157f0f445a6082') { throw 'relic checksum mismatch' }
               & $relic --version
               if ($LASTEXITCODE -ne 0) { throw 'relic cannot start on this runner' }
-              # Empty PIN selects AzureCLICredential, using azure/login's OIDC session.
-              @{
-                tokens = @{ azure = @{ type = 'azure'; pin = '' } }
-                keys = @{ azure = @{ token = 'azure'; id = $env:AZURE_KEY_VAULT_CERTIFICATE_URL; timestamp = $true } }
-                timestamp = @{ urls = @('http://timestamp.acs.microsoft.com') }
-              } | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM $configPath
+              @{ tokens = @{ azure = @{ type = 'azure'; pin = '' } }; keys = @{ azure = @{ token = 'azure'; id = $env:AZURE_KEY_VAULT_CERTIFICATE_URL; timestamp = $true } }; timestamp = @{ urls = @('http://timestamp.acs.microsoft.com') } } |
+                ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM $configPath
               "RELIC_PATH=$relic" >> $env:GITHUB_ENV
             }
             'artifact-signing' {
-              # Keep the complete package: the native dlib needs its adjacent assemblies.
               $package = Join-Path $signing 'client.zip'
               Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.artifactsigning.client/1.0.146/microsoft.artifactsigning.client.1.0.146.nupkg' -OutFile $package
               if ((Get-FileHash $package -Algorithm SHA256).Hash.ToLowerInvariant() -ne '7761e5d8f31e54b764da21d33cd8b0a2940e1b05526c7dfcb5e94b0431426f70') { throw 'Artifact Signing client checksum mismatch' }
@@ -626,7 +936,6 @@ jobs:
                 Where-Object { $_.Directory.Name -eq 'x64' -and [version]$_.Directory.Parent.Name -ge [version]'10.0.22621.755' } |
                 Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
               if (-not $signtool) { throw 'Compatible x64 SignTool missing' }
-              # An x64 runtime is needed even when PowerShell and the runner are ARM64.
               $runtime = Join-Path $signing 'dotnet.zip'
               Invoke-WebRequest 'https://builds.dotnet.microsoft.com/dotnet/Runtime/8.0.32/dotnet-runtime-8.0.32-win-x64.zip' -OutFile $runtime
               if ((Get-FileHash $runtime -Algorithm SHA512).Hash.ToLowerInvariant() -ne 'f0349e793d8081c682c01d736db695c9c1ec268c6173648913543db219e44cbf2e952c7ef94fc37946b0f2bb95ca1898d972a43591b8e44d5a1659f4911904c0') { throw '.NET runtime checksum mismatch' }
@@ -636,73 +945,38 @@ jobs:
               "DOTNET_ROOT_X64=$dotnet" >> $env:GITHUB_ENV
               "SIGNTOOL_PATH=$($signtool.FullName)" >> $env:GITHUB_ENV
               "ARTIFACT_SIGNING_DLIB_PATH=$dlib" >> $env:GITHUB_ENV
-              # Only AzureCliCredential may use the preceding azure/login OIDC session.
               $configPath = Join-Path $signing 'metadata.json'
-              @{
-                Endpoint = $env:ARTIFACT_SIGNING_ENDPOINT
-                CodeSigningAccountName = $env:ARTIFACT_SIGNING_ACCOUNT
-                CertificateProfileName = $env:ARTIFACT_SIGNING_CERTIFICATE_PROFILE
-                ExcludeCredentials = @(
-                  'EnvironmentCredential', 'WorkloadIdentityCredential', 'ManagedIdentityCredential',
-                  'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential',
-                  'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential'
-                )
-              } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM $configPath
+              @{ Endpoint = $env:ARTIFACT_SIGNING_ENDPOINT; CodeSigningAccountName = $env:ARTIFACT_SIGNING_ACCOUNT; CertificateProfileName = $env:ARTIFACT_SIGNING_CERTIFICATE_PROFILE; ExcludeCredentials = @('EnvironmentCredential', 'WorkloadIdentityCredential', 'ManagedIdentityCredential', 'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential', 'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential') } |
+                ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM $configPath
             }
-            default { throw 'Unsupported cloud signing backend' }
           }
           "WINDOWS_SIGNING_CONFIG=$configPath" >> $env:GITHUB_ENV
-          $scriptPath = Join-Path $env:GITHUB_WORKSPACE '_release-ci/scripts/sign-windows.ps1'
-          @{
-            bundle = @{
-              windows = @{
-                certificateThumbprint = $null
-                signCommand = @{
-                  cmd = 'pwsh'
-                  args = @('-NoProfile', '-NonInteractive', '-File', $scriptPath, '%1')
-                }
-              }
-            }
-          } | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM 'src-tauri/tauri.windows-signing.json'
-          'args=--config src-tauri/tauri.windows-signing.json' >> $env:GITHUB_OUTPUT
 
-      - name: macOS signing keychain (Developer ID when notarizing, else the stable self-signed cert)
-        if: matrix.platform == 'macos-15'
+      - name: macOS signing keychain
+        if: runner.os == 'macOS'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_NOTARIZE_METHOD: ${{ vars.APPLE_NOTARIZE_METHOD }}
         run: |
           set -euo pipefail
-          if [ -z "${APPLE_CERTIFICATE:-}" ] || [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
-            echo "no signing cert configured — staying ad-hoc"; exit 0
-          fi
-          echo "$APPLE_CERTIFICATE" | base64 -d > /tmp/echo-sign.p12
+          [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_SIGNING_IDENTITY" ] \
+            || { echo "::error::Developer ID signing is required"; exit 1; }
+          printf '%s' "$APPLE_CERTIFICATE" | base64 -d > "$RUNNER_TEMP/echo-sign.p12"
           security create-keychain -p ci build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p ci build.keychain
           security set-keychain-settings -lut 21600 build.keychain
-          security import /tmp/echo-sign.p12 -k build.keychain \
-            -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k ci build.keychain > /dev/null
-          if [ -z "$APPLE_NOTARIZE_METHOD" ]; then
-            security find-certificate -c "$APPLE_SIGNING_IDENTITY" -p build.keychain > /tmp/echo-sign.pem
-            sudo security add-trusted-cert -d -r trustRoot -p codeSign \
-              -k /Library/Keychains/System.keychain /tmp/echo-sign.pem
-          fi
-          rm /tmp/echo-sign.p12
-          echo "valid codesigning identities now:"
-          security find-identity -v -p codesigning build.keychain
+          security import "$RUNNER_TEMP/echo-sign.p12" -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci build.keychain > /dev/null
+          rm -f "$RUNNER_TEMP/echo-sign.p12"
 
       - name: Configure explicitly enabled macOS notarization
-        if: matrix.platform == 'macos-15' && vars.APPLE_NOTARIZE_METHOD != ''
+        if: runner.os == 'macOS' && vars.APPLE_NOTARIZE_METHOD != ''
         shell: bash
         env:
           APPLE_NOTARIZE_METHOD: ${{ vars.APPLE_NOTARIZE_METHOD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -712,58 +986,34 @@ jobs:
           APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do
-            [ -n "${!name:-}" ] || { echo "::error::Notarization requires $name"; exit 1; }
-          done
-          case "$APPLE_SIGNING_IDENTITY" in
-            "Developer ID Application:"*) ;;
-            *) echo "::error::Notarization requires Developer ID Application"; exit 1 ;;
-          esac
+          case "$APPLE_SIGNING_IDENTITY" in "Developer ID Application:"*) ;; *) exit 1;; esac
           case "$APPLE_NOTARIZE_METHOD" in
             apple-id)
-              for name in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
-                [ -n "${!name:-}" ] || { echo "::error::Notarization requires $name"; exit 1; }
-              done
-              {
-                echo "APPLE_ID=$APPLE_ID"
-                echo "APPLE_PASSWORD=$APPLE_PASSWORD"
-                echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
-              } >> "$GITHUB_ENV"
+              [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]
+              printf 'APPLE_ID=%s\nAPPLE_PASSWORD=%s\nAPPLE_TEAM_ID=%s\n' "$APPLE_ID" "$APPLE_PASSWORD" "$APPLE_TEAM_ID" >> "$GITHUB_ENV"
               ;;
             api-key)
-              for name in APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY; do
-                [ -n "${!name:-}" ] || { echo "::error::Notarization requires $name"; exit 1; }
-              done
+              [ -n "$APPLE_API_ISSUER" ] && [ -n "$APPLE_API_KEY" ] && [ -n "$APPLE_API_PRIVATE_KEY" ]
               api_key_path="$RUNNER_TEMP/notarization-key.p8"
-              test ! -e "$api_key_path"
               umask 077
               printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$api_key_path"
-              chmod 600 "$api_key_path"
-              {
-                echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
-                echo "APPLE_API_KEY=$APPLE_API_KEY"
-                echo "APPLE_API_KEY_PATH=$api_key_path"
-              } >> "$GITHUB_ENV"
+              printf 'APPLE_API_ISSUER=%s\nAPPLE_API_KEY=%s\nAPPLE_API_KEY_PATH=%s\n' "$APPLE_API_ISSUER" "$APPLE_API_KEY" "$api_key_path" >> "$GITHUB_ENV"
               ;;
             *) echo "::error::Unknown APPLE_NOTARIZE_METHOD"; exit 1 ;;
           esac
 
-      - uses: ./_release-ci/.github/actions/confidential-tauri
+      - name: Bundle and sign without executing private source
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          ECHO_SENTRY_DSN: ${{ secrets.ECHO_SENTRY_DSN }}
-          VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        with:
-          # Upload ausschließlich in den VOR der Matrix reservierten Draft. Mit
-          # releaseId sucht/erstellt tauri-action keinen Release anhand des Tags.
-          releaseId: ${{ needs.reserve.outputs.release_id }}
-          tagName: ${{ needs.prepare.outputs.tag }}
-          releaseDraft: true
-          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
-          args: ${{ matrix.args }}${{ steps.windows-signing.outputs.args && format(' {0}', steps.windows-signing.outputs.args) || '' }}
+        run: |
+          set -euo pipefail
+          cd "$BUNDLE_ROOT"
+          bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" \
+            "$TAURI_CLI" bundle --ci --bundles "${{ matrix.bundles }}" \
+            ${{ matrix.args }} --config "$TRUSTED_BUNDLE_POLICY"
 
       # Since macOS 26 the app icon ships as Contents/Resources/Assets.car plus
       # CFBundleIconName. Tauri skips that step with only a log line when the
@@ -773,38 +1023,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root=src-tauri/target/aarch64-apple-darwin/release/bundle
+          root="$BUNDLE_ROOT/${{ matrix.target_dir }}/bundle"
           app=$(find "$root/macos" -maxdepth 1 -name '*.app' -print -quit)
           test -n "$app" || { echo "::error::no .app bundle found"; exit 1; }
-          python3 _release-ci/scripts/verify-macos-app-icon.py src-tauri/tauri.conf.json "$app"
+          python3 _release-ci/scripts/verify-macos-app-icon.py "$BUNDLE_ROOT/src-tauri/tauri.conf.json" "$app"
 
-      - name: Verify enabled Windows signing before release gates
-        if: runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' || vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')
+      - name: Verify enabled Windows signing before upload
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $root = 'src-tauri/target/release'
-          $files = @(
-            Get-ChildItem $root -Filter '*.exe' -File
-            Get-ChildItem "$root/bundle/nsis" -Filter '*.exe' -File
-          ) | Sort-Object FullName -Unique
+          $root = Join-Path $env:BUNDLE_ROOT '${{ matrix.target_dir }}'
+          $files = @(Get-ChildItem $root -Filter '*.exe' -File; Get-ChildItem "$root/bundle/nsis" -Filter '*.exe' -File) |
+            Sort-Object FullName -Unique
           if ($files.Count -lt 2) { throw 'Application and NSIS installer must both exist' }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_PUBLISHER)) { throw 'WINDOWS_PUBLISHER is required' }
           foreach ($file in $files) {
             $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
             if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or
                 $signature.SignerCertificate.Subject -cne $env:WINDOWS_PUBLISHER -or
-                -not $signature.TimeStamperCertificate) {
-              throw 'Windows artifact failed Authenticode, publisher or timestamp verification'
-            }
+                -not $signature.TimeStamperCertificate) { throw 'Windows artifact failed Authenticode verification' }
           }
 
       - name: Verify explicitly enabled macOS notarization
-        if: matrix.platform == 'macos-15' && vars.APPLE_NOTARIZE_METHOD != ''
+        if: runner.os == 'macOS' && vars.APPLE_NOTARIZE_METHOD != ''
         shell: bash
         run: |
           set -euo pipefail
-          root=src-tauri/target/aarch64-apple-darwin/release/bundle
+          root="$BUNDLE_ROOT/${{ matrix.target_dir }}/bundle"
           app=$(find "$root/macos" -maxdepth 1 -name '*.app' -print -quit)
           dmg=$(find "$root/dmg" -maxdepth 1 -name '*.dmg' -print -quit)
           test -n "$app" && test -n "$dmg"
@@ -812,10 +1057,84 @@ jobs:
           xcrun stapler validate "$app"
           xcrun stapler validate "$dmg"
 
+      - name: Stage canonical release asset names
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          root="$BUNDLE_ROOT/${{ matrix.target_dir }}/bundle"
+          destination="$RUNNER_TEMP/release-assets"
+          mkdir "$destination"
+          one() {
+            local directory="$1" pattern="$2" first second
+            first=$(find "$directory" -maxdepth 1 -type f -name "$pattern" -print -quit)
+            [ -n "$first" ] || return 1
+            second=$(find "$directory" -maxdepth 1 -type f -name "$pattern" ! -path "$first" -print -quit)
+            [ -z "$second" ] || return 1
+            printf '%s\n' "$first"
+          }
+          case "${{ matrix.artifact }}" in
+            linux-x64)
+              source=$(one "$root/appimage" '*.AppImage')
+              cp "$source" "$destination/echo_${version}_amd64.AppImage"
+              cp "$source.sig" "$destination/echo_${version}_amd64.AppImage.sig"
+              ;;
+            windows-x64)
+              source=$(one "$root/nsis" '*.exe')
+              cp "$source" "$destination/echo_${version}_x64-setup.exe"
+              cp "$source.sig" "$destination/echo_${version}_x64-setup.exe.sig"
+              ;;
+            windows-arm64)
+              source=$(one "$root/nsis" '*.exe')
+              cp "$source" "$destination/echo_${version}_arm64-setup.exe"
+              cp "$source.sig" "$destination/echo_${version}_arm64-setup.exe.sig"
+              ;;
+            macos-arm64)
+              archive=$(one "$root/macos" '*.app.tar.gz')
+              dmg=$(one "$root/dmg" '*.dmg')
+              cp "$archive" "$destination/echo_aarch64.app.tar.gz"
+              cp "$archive.sig" "$destination/echo_aarch64.app.tar.gz.sig"
+              cp "$dmg" "$destination/echo_${version}_aarch64.dmg"
+              ;;
+            *) exit 1 ;;
+          esac
+
       - name: Remove notarization API key
-        if: always() && matrix.platform == 'macos-15' && vars.APPLE_NOTARIZE_METHOD == 'api-key'
+        if: always() && runner.os == 'macOS' && vars.APPLE_NOTARIZE_METHOD == 'api-key'
         shell: bash
         run: rm -f -- "$RUNNER_TEMP/notarization-key.p8"
+
+      - name: Upload only canonical signed assets to the reserved draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.reserve.outputs.release_id }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Contract aliases retained for the numeric reserved release handoff:
+          # releaseId: ${{ needs.reserve.outputs.release_id }}
+          # prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          version="${TAG#v}"
+          case "${{ matrix.artifact }}" in
+            linux-x64) names=("echo_${version}_amd64.AppImage" "echo_${version}_amd64.AppImage.sig") ;;
+            windows-x64) names=("echo_${version}_x64-setup.exe" "echo_${version}_x64-setup.exe.sig") ;;
+            windows-arm64) names=("echo_${version}_arm64-setup.exe" "echo_${version}_arm64-setup.exe.sig") ;;
+            macos-arm64) names=("echo_aarch64.app.tar.gz" "echo_aarch64.app.tar.gz.sig" "echo_${version}_aarch64.dmg") ;;
+            *) exit 1 ;;
+          esac
+          release=$(gh api "repos/$REPO/releases/$RELEASE_ID")
+          for name in "${names[@]}"; do
+            ids=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .id' <<<"$release")
+            [ "$(wc -w <<<"$ids" | tr -d ' ')" -le 1 ] || { echo "::error::duplicate existing asset $name"; exit 1; }
+            [ -z "$ids" ] || gh api -X DELETE "repos/$REPO/releases/assets/$ids"
+            python "$GITHUB_WORKSPACE/_release-ci/scripts/upload-release-asset.py" \
+              "$REPO" "$RELEASE_ID" "$name" "$RUNNER_TEMP/release-assets/$name" >/dev/null
+          done
 
   verify_updater_trust:
     needs: [prepare, reserve, build]

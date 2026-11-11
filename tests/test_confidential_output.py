@@ -29,14 +29,97 @@ def run_block(workflow, marker):
     return '\n'.join(lines) + '\n'
 
 
+def workflow_jobs(workflow):
+    """Return top-level job blocks without depending on a YAML package."""
+    body = workflow.split('\njobs:\n', 1)[1]
+    matches = list(re.finditer(r'(?m)^  ([A-Za-z0-9_]+):\n', body))
+    return {
+        match.group(1): body[match.start():(matches[index + 1].start() if index + 1 < len(matches) else len(body))]
+        for index, match in enumerate(matches)
+    }
+
+
+def release_authority_contract(workflow):
+    """Private execution and release/signing authority must never share a job."""
+    jobs = workflow_jobs(workflow)
+    private_execution = (
+        'Checkout private source',
+        'run-confidential.sh npm ci',
+        'run-confidential.sh npm run ',
+        'uses: ./_release-ci/.github/actions/confidential-tauri',
+    )
+    release_authority = (
+        'environment: release-signing',
+        'contents: write',
+        'id-token: write',
+        'secrets.TAURI_SIGNING_PRIVATE_KEY',
+        'secrets.APPLE_CERTIFICATE',
+        'secrets.AZURE_CLIENT_ID',
+        'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}',
+        'upload-release-asset.py',
+    )
+    for name, job in jobs.items():
+        if any(marker in job for marker in private_execution) and any(marker in job for marker in release_authority):
+            raise AssertionError(f'private execution and release authority mixed in job {name}')
+
+    build = jobs['build_unsigned']
+    if 'permissions:\n      contents: read' not in build:
+        raise AssertionError('private build must be contents-read only')
+    for forbidden in ('environment: release-signing', 'contents: write', 'id-token: write',
+                      'secrets.TAURI_SIGNING_PRIVATE_KEY', 'secrets.GITHUB_TOKEN',
+                      'secrets.APPLE_', 'secrets.AZURE_', 'if: ${{ false }}'):
+        if forbidden in build:
+            raise AssertionError(f'private build retained release authority: {forbidden}')
+    for required in ('--no-bundle', 'Upload immutable unsigned platform input',
+                     'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'):
+        if required not in build:
+            raise AssertionError(f'private build is missing isolated handoff step: {required}')
+
+    binding = jobs['bind_unsigned_artifacts']
+    if 'permissions:\n      contents: read\n      actions: read' not in binding:
+        raise AssertionError('artifact binder must be read-only')
+    for forbidden in ('environment: release-signing', 'contents: write', 'id-token: write', 'secrets.'):
+        if forbidden in binding:
+            raise AssertionError(f'artifact binder retained release authority: {forbidden}')
+    for required in ('MANIFEST.sha256', 'sha256sum -c MANIFEST.sha256',
+                     'artifact_id: ${{ steps.bind.outputs.artifact-id }}',
+                     'artifact_digest: ${{ steps.bind.outputs.artifact-digest }}'):
+        if required not in binding:
+            raise AssertionError(f'handoff is not digest-bound: {required}')
+
+    signing = jobs['build']
+    for required in ('needs: [prepare, reserve, bind_unsigned_artifacts]',
+                     'environment: release-signing', 'contents: write', 'id-token: write',
+                     'Checkout trusted public CI controls on the fresh runner',
+                     'ref: ${{ github.sha }}', 'path: _release-ci',
+                     'ARTIFACT_ID: ${{ needs.bind_unsigned_artifacts.outputs.artifact_id }}',
+                     'EXPECTED_DIGEST: ${{ needs.bind_unsigned_artifacts.outputs.artifact_digest }}',
+                     'handoff digest mismatch', '$RUNNER_TEMP/platform-handoff',
+                     "'beforeBundleCommand': None", '@tauri-apps/cli@2.10.1',
+                     'Bundle and sign without executing private source'):
+        if required not in signing:
+            raise AssertionError(f'privileged phase is missing a trust-boundary control: {required}')
+    for forbidden in ('Checkout private source', 'ECHO_TAURI_DEPLOY_KEY', 'SOURCE_REPO',
+                      'run-confidential.sh npm ci', 'run-confidential.sh npm run ',
+                      'uses: ./_release-ci/.github/actions/confidential-tauri'):
+        if forbidden in signing:
+            raise AssertionError(f'privileged phase executes private-controlled code: {forbidden}')
+    if not signing.index('Checkout trusted public CI controls on the fresh runner') < signing.index('Download exact handoff ID'):
+        raise AssertionError('trusted controls must be loaded before untrusted artifacts')
+    return jobs
+
+
 def confidential_contract(texts):
     """Explicit public/private boundary inventory, independent of tool output format."""
     build, pr, promote = (texts[name] for name in ('build', 'pr-check', 'promote-stable'))
     expected = {
         'build': {
-            'bash _release-ci/scripts/run-confidential.sh node': 1,
+            'bash _release-ci/scripts/run-confidential.sh node': 2,
             'bash _release-ci/scripts/run-confidential.sh npm ci': 1,
-            'uses: ./_release-ci/.github/actions/confidential-tauri': 1,
+            'bash _release-ci/scripts/run-confidential.sh npm run tauri build': 1,
+            'bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" npm init -y': 1,
+            'bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" npm install \\\n            --ignore-scripts': 1,
+            'bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" \\\n            "$TAURI_CLI" bundle': 1,
             'bash scripts/run-confidential.sh bash -s -- "$expected"': 1,
             'bash scripts/run-confidential.sh python3 scripts/verify-updater-signatures.py': 1,
         },
@@ -61,18 +144,20 @@ def confidential_contract(texts):
             raise AssertionError('direct private tool invocation bypasses the boundary')
     for text, count in ((build, 1), (pr, 2)):
         for guard in ('if [ -e "$path" ] || [ -L "$path" ]; then',
-                      'repository: ${{ github.repository }}', 'ref: ${{ github.sha }}',
-                      'path: _release-ci'):
+                      ):
             if text.count(guard) != count:
                 raise AssertionError('public controls must be independently checked out behind a collision guard')
-        if text.count('persist-credentials: false') != count + (text is build):
+        trusted_checkout_count = 2 if text is build else count
+        for guard in ('repository: ${{ github.repository }}', 'ref: ${{ github.sha }}', 'path: _release-ci'):
+            if text.count(guard) != trusted_checkout_count:
+                raise AssertionError('trusted controls must be checked out at the exact workflow revision')
+        if text.count('persist-credentials: false') != trusted_checkout_count:
             raise AssertionError('trusted checkouts must not persist credentials')
-    if f'ref: {PIN}' not in build or 'repository: tauri-apps/tauri-action' not in build:
-        raise AssertionError('upstream action pin changed')
     if 'uses: tauri-apps/tauri-action@' in build:
         raise AssertionError('upstream action must never run outside output isolation')
-    if not build.index('Checkout private source') < build.index('Reserve trusted CI paths') < build.index('Checkout trusted public CI controls') < build.index('Checkout pinned upstream Tauri action'):
+    if not build.index('Checkout private source') < build.index('Reserve trusted CI paths') < build.index('Checkout trusted public CI controls'):
         raise AssertionError('private root must precede trusted checkouts')
+    release_authority_contract(build)
     return expected
 
 
@@ -176,6 +261,44 @@ class ConfidentialWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.texts = {name: (WORKFLOWS / (name + '.yml')).read_text() for name in ('build', 'pr-check', 'promote-stable')}
 
+    def test_private_build_release_authority_split_and_mutations(self):
+        jobs = release_authority_contract(self.texts['build'])
+        self.assertIn('permissions:\n      contents: read', jobs['build_unsigned'])
+        self.assertNotIn('environment: release-signing', jobs['build_unsigned'])
+        self.assertNotIn('if: ${{ false }}', jobs['build_unsigned'])
+        self.assertIn('environment: release-signing', jobs['build'])
+        self.assertIn('$RUNNER_TEMP/platform-handoff', jobs['build'])
+        self.assertNotIn('$GITHUB_WORKSPACE/platform-handoff', jobs['build'])
+
+        build_anchor = '    strategy:\n      fail-fast: false\n'
+        for authority in (
+            '    environment: release-signing\n',
+            '    permissions:\n      contents: write\n',
+            '    permissions:\n      id-token: write\n',
+            '          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}\n',
+            '          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n',
+        ):
+            with self.subTest(authority=authority.strip()):
+                mutated = self.texts['build'].replace(build_anchor, authority + build_anchor, 1)
+                with self.assertRaises(AssertionError):
+                    release_authority_contract(mutated)
+
+        # A synthetic private lifecycle step on the privileged runner must make
+        # the wall fail: the later control path is a fresh checkout, never an
+        # action or script carried over from the build artifact.
+        signing_anchor = '      - name: Checkout trusted public CI controls on the fresh runner\n'
+        for private_step in ('run-confidential.sh npm ci',
+                             'run-confidential.sh npm run attacker-lifecycle',
+                             'uses: ./_release-ci/.github/actions/confidential-tauri'):
+            with self.subTest(private_step=private_step):
+                mutated = self.texts['build'].replace(signing_anchor, f'      # {private_step}\n' + signing_anchor, 1)
+                with self.assertRaises(AssertionError):
+                    release_authority_contract(mutated)
+
+        mutated = self.texts['build'].replace('handoff digest mismatch', 'handoff integrity failure', 1)
+        with self.assertRaises(AssertionError):
+            release_authority_contract(mutated)
+
     def test_contract_and_every_individual_unwrapped_boundary_mutation(self):
         expected = confidential_contract(self.texts)
         for name, commands in expected.items():
@@ -192,7 +315,7 @@ class ConfidentialWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.assertEqual(subprocess.run(['bash', '-c', guard], cwd=root, capture_output=True).returncode, 0)
-            for name in ('_release-ci', '_release-tauri'):
+            for name in ('_release-ci',):
                 path = root / name
                 path.symlink_to(root / 'missing')
                 self.assertNotEqual(subprocess.run(['bash', '-c', guard], cwd=root, capture_output=True).returncode, 0)
