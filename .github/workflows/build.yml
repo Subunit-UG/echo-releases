@@ -553,26 +553,33 @@ jobs:
           fs.mkdirSync(tauriTarget, { recursive: true, mode: 0o700 });
 
           const within = (base, candidate) => candidate === base || candidate.startsWith(base + path.sep);
-          const destinationFor = (source) => {
-            const resolved = path.resolve(source);
-            if (!within(workspace, resolved)) throw new Error('bundle input escapes private workspace');
-            return path.join(root, path.relative(workspace, resolved));
+          const safePath = (raw, expectedRoot, allowGlob = true) => {
+            if (typeof raw !== 'string' || !raw || raw.includes('\0') || /^[a-z]+:\/\//i.test(raw)) {
+              throw new Error('invalid bundle path');
+            }
+            if (path.isAbsolute(raw) || /^[A-Za-z]:[\\/]/.test(raw) || /^[/\\]{2}/.test(raw)) {
+              throw new Error('absolute bundle path rejected');
+            }
+            const normalized = raw.replace(/\\/g, '/');
+            const segments = normalized.split('/');
+            if (segments.some((segment) => !segment || segment === '..' || segment.startsWith('.')) || normalized.includes(':')) {
+              throw new Error('dot or empty bundle path segment rejected');
+            }
+            if (expectedRoot && segments[0] !== expectedRoot) throw new Error('bundle path outside allowlist');
+            if (!allowGlob && /[?*\[\]{}]/.test(normalized)) throw new Error('glob destination rejected');
+            return segments.join('/');
           };
-          const copyEntry = (source) => {
+          const copyBundleEntry = (source, expectedRoot) => {
             const resolved = path.resolve(source);
-            if (!within(workspace, resolved) || !fs.existsSync(resolved)) return false;
+            if (!within(tauriSource, resolved) || !fs.existsSync(resolved)) return false;
+            const relative = safePath(path.relative(tauriSource, resolved), expectedRoot);
             const stat = fs.lstatSync(resolved);
-            const destination = destinationFor(resolved);
+            if (stat.isSymbolicLink()) throw new Error('bundle symlink rejected');
+            const destination = path.join(tauriTarget, ...relative.split('/'));
             fs.mkdirSync(path.dirname(destination), { recursive: true });
-            if (stat.isSymbolicLink()) {
-              const target = fs.readlinkSync(resolved);
-              if (path.isAbsolute(target)) throw new Error('absolute bundle symlink rejected');
-              const finalTarget = fs.realpathSync(path.resolve(path.dirname(resolved), target));
-              if (!within(workspace, finalTarget)) throw new Error('escaping bundle symlink rejected');
-              fs.symlinkSync(target, destination, fs.statSync(finalTarget).isDirectory() ? 'dir' : 'file');
-            } else if (stat.isDirectory()) {
+            if (stat.isDirectory()) {
               fs.mkdirSync(destination, { recursive: true });
-              for (const name of fs.readdirSync(resolved)) copyEntry(path.join(resolved, name));
+              for (const name of fs.readdirSync(resolved)) copyBundleEntry(path.join(resolved, name), expectedRoot);
             } else if (stat.isFile()) {
               fs.copyFileSync(resolved, destination);
               fs.chmodSync(destination, stat.mode & 0o777);
@@ -581,78 +588,87 @@ jobs:
             }
             return true;
           };
-          const copySpec = (raw) => {
-            if (typeof raw !== 'string' || !raw || /^[a-z]+:\/\//i.test(raw)) return;
-            if (path.isAbsolute(raw) || /^[A-Za-z]:[\\/]/.test(raw)) throw new Error('absolute bundle path rejected');
-            const wildcard = raw.search(/[?*[{]/);
-            const relative = wildcard === -1 ? raw : raw.slice(0, wildcard);
-            let source = path.resolve(tauriSource, relative || '.');
+          const copyBundleSpec = (raw, expectedRoot) => {
+            const spec = safePath(raw, expectedRoot);
+            const wildcard = spec.search(/[?*[{]/);
+            const staticPrefix = (wildcard === -1 ? spec : spec.slice(0, wildcard)).replace(/\/+$/, '');
+            let source = path.resolve(tauriSource, staticPrefix || expectedRoot);
             if (wildcard !== -1 && fs.existsSync(source) && !fs.lstatSync(source).isDirectory()) source = path.dirname(source);
-            if (copyEntry(source)) return;
+            if (copyBundleEntry(source, expectedRoot)) return spec;
             const directory = path.dirname(source);
             const prefix = path.basename(source);
+            let copied = false;
             if (fs.existsSync(directory)) {
               for (const name of fs.readdirSync(directory)) {
-                if (name.startsWith(prefix + '-')) copyEntry(path.join(directory, name));
+                if (name.startsWith(prefix)) copied = copyBundleEntry(path.join(directory, name), expectedRoot) || copied;
               }
             }
+            if (!copied) throw new Error('bundle path has no staged input');
+            return spec;
           };
-          const values = (value) => Array.isArray(value) ? value : value && typeof value === 'object' ? Object.keys(value) : [value];
-          const copyValues = (value) => values(value).forEach(copySpec);
+          const sourceList = (value, expectedRoot) => {
+            if (value === undefined) return [];
+            const entries = Array.isArray(value) ? value : [value];
+            return entries.map((entry) => copyBundleSpec(entry, expectedRoot));
+          };
+          const resourcePaths = (value) => {
+            if (value === undefined) return [];
+            if (Array.isArray(value) || typeof value === 'string') return sourceList(value, 'resources');
+            if (!value || typeof value !== 'object') throw new Error('invalid resources allowlist');
+            return Object.fromEntries(Object.entries(value).map(([source, destination]) => [
+              copyBundleSpec(source, 'resources'), safePath(destination, null, false)
+            ]));
+          };
 
-          const configNames = fs.readdirSync(tauriSource).filter((name) => /^tauri(?:\.[a-z]+)?\.conf\.json$/.test(name));
-          if (!configNames.includes('tauri.conf.json')) throw new Error('tauri.conf.json missing');
-          let primary;
-          for (const name of configNames) {
-            const source = path.join(tauriSource, name);
-            const config = JSON.parse(fs.readFileSync(source, 'utf8'));
-            if (name === 'tauri.conf.json') primary = config;
-            copyEntry(source);
-            const bundle = config.bundle || {};
-            copyValues(bundle.icon);
-            copyValues(bundle.resources);
-            copyValues(bundle.externalBin);
-            copySpec(bundle.licenseFile);
-            const mac = bundle.macOS || bundle.macos || {};
-            copySpec(mac.entitlements); copySpec(mac.infoPlist);
-            copyValues(mac.frameworks); copyValues(mac.files);
-            const dmg = mac.dmg || {};
-            copySpec(dmg.background); copySpec(dmg.windowBackground);
-            const windows = bundle.windows || {};
-            copySpec(windows.iconPath);
-            if (windows.webviewInstallMode) copySpec(windows.webviewInstallMode.path);
-            const nsis = windows.nsis || {};
-            copySpec(nsis.installerIcon); copySpec(nsis.headerImage); copySpec(nsis.sidebarImage);
-            const linux = bundle.linux || {};
-            if (linux.appimage) copyValues(linux.appimage.files);
-          }
-          for (const conventional of ['icons', 'resources']) copyEntry(path.join(tauriSource, conventional));
-
+          const primaryPath = path.join(tauriSource, 'tauri.conf.json');
+          if (!fs.existsSync(primaryPath)) throw new Error('tauri.conf.json missing');
+          const primary = JSON.parse(fs.readFileSync(primaryPath, 'utf8'));
+          const productName = primary.productName;
           const version = process.env.TAG.slice(1);
-          const binary = primary.mainBinaryName || 'echo';
-          if (!/^[A-Za-z0-9_.-]+$/.test(binary) || !/^[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?$/.test(version)) {
-            throw new Error('invalid bundle identity');
+          const identifier = primary.identifier;
+          if (typeof productName !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$/.test(productName)) {
+            throw new Error('invalid product name');
           }
-          const manifest = `[package]\nname = ${JSON.stringify(binary)}\nversion = ${JSON.stringify(version)}\nedition = "2021"\ndefault-run = ${JSON.stringify(binary)}\n\n[[bin]]\nname = ${JSON.stringify(binary)}\npath = "src/main.rs"\n\n[dependencies]\ntauri = "2"\n`;
-          fs.writeFileSync(path.join(tauriTarget, 'Cargo.toml'), manifest, { mode: 0o600 });
-          fs.mkdirSync(path.join(tauriTarget, 'src'), { recursive: true });
-          fs.writeFileSync(path.join(tauriTarget, 'src/main.rs'), 'fn main() {}\n', { mode: 0o600 });
+          if (primary.version !== version || !/^[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?$/.test(version)) {
+            throw new Error('invalid bundle version');
+          }
+          if (typeof identifier !== 'string' || !/^[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)+$/.test(identifier)) {
+            throw new Error('invalid bundle identifier');
+          }
+          const bundle = primary.bundle && typeof primary.bundle === 'object' ? primary.bundle : {};
+          const icon = sourceList(bundle.icon, 'icons');
+          const resources = resourcePaths(bundle.resources);
+          const binary = 'echo';
 
           const targetSource = path.resolve(workspace, process.env.TARGET_DIR);
           const targetDestination = path.resolve(root, process.env.TARGET_DIR);
           if (!within(workspace, targetSource) || !fs.existsSync(targetSource)) throw new Error('compiled target directory missing');
           fs.mkdirSync(targetDestination, { recursive: true });
           const executable = process.platform === 'win32' ? `${binary}.exe` : binary;
-          if (!copyEntry(path.join(targetSource, executable))) throw new Error('compiled application binary missing');
+          const copyCompiledFile = (source) => {
+            const resolved = path.resolve(source);
+            if (!within(targetSource, resolved) || !fs.existsSync(resolved)) return false;
+            const stat = fs.lstatSync(resolved);
+            if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('compiled input must be a regular file');
+            const destination = path.join(targetDestination, path.basename(resolved));
+            fs.copyFileSync(resolved, destination);
+            fs.chmodSync(destination, stat.mode & 0o777);
+            return true;
+          };
+          if (!copyCompiledFile(path.join(targetSource, executable))) throw new Error('compiled application binary missing');
           for (const name of fs.readdirSync(targetSource)) {
             if (name === executable || /\.(?:d|pdb|rlib|rmeta)$/i.test(name)) continue;
             const candidate = path.join(targetSource, name);
             const stat = fs.lstatSync(candidate);
-            if (stat.isFile() && (/\.(?:exe|dll|dylib|so)$/i.test(name) || (stat.mode & 0o111))) copyEntry(candidate);
+            if (stat.isSymbolicLink()) throw new Error('compiled symlink rejected');
+            if (stat.isFile() && (/\.(?:exe|dll|dylib|so)$/i.test(name) || (stat.mode & 0o111))) copyCompiledFile(candidate);
           }
           fs.writeFileSync(path.join(root, 'handoff-metadata.json'), JSON.stringify({
-            schema: 1, artifact: process.env.ARTIFACT, source_commit: process.env.SOURCE_COMMIT,
+            schema: 2, artifact: process.env.ARTIFACT, source_commit: process.env.SOURCE_COMMIT,
             tag: process.env.TAG, binary, target_dir: process.env.TARGET_DIR
+          }) + '\n', { mode: 0o600 });
+          fs.writeFileSync(path.join(root, 'handoff-bundle-config.json'), JSON.stringify({
+            productName, version, identifier, icon, resources
           }) + '\n', { mode: 0o600 });
           NODE
           archive="$RUNNER_TEMP/unsigned-${{ matrix.artifact }}.tar.gz"
@@ -823,47 +839,219 @@ jobs:
           python "$GITHUB_WORKSPACE/_release-ci/scripts/validate-macos-app-archive.py" \
             "$platform_archive" "$RUNNER_TEMP/platform-handoff"
 
-      - name: Verify handoff identity and write fail-closed bundle policy
+      - name: Rebuild trusted bundle root from the allowlisted handoff
         shell: bash
         env:
           ARTIFACT: ${{ matrix.artifact }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET_DIR: ${{ matrix.target_dir }}
           TRUSTED_SIGN_SCRIPT: ${{ github.workspace }}/_release-ci/scripts/sign-windows.ps1
         run: |
           set -euo pipefail
-          bundle_root="$RUNNER_TEMP/platform-handoff/bundle-input"
-          python - "$bundle_root/handoff-metadata.json" <<'PY'
-          import json, os, pathlib, sys
-          metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
-          expected = {'schema': 1, 'artifact': os.environ['ARTIFACT'],
-                      'source_commit': os.environ['SOURCE_COMMIT'], 'tag': os.environ['TAG']}
-          if any(metadata.get(key) != value for key, value in expected.items()):
+          untrusted_root="$RUNNER_TEMP/platform-handoff/bundle-input"
+          trusted_parent="$(mktemp -d "${TMPDIR:-/tmp}/echo-trusted-bundle.XXXXXX")"
+          trusted_root="$trusted_parent/bundle"
+          cargo_home="$trusted_parent/cargo-home"
+          python3 - "$untrusted_root" "$trusted_root" "$cargo_home" <<'PY'
+          import glob
+          import json
+          import os
+          import pathlib
+          import re
+          import shutil
+          import stat
+          import sys
+
+          untrusted_root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+          trusted_root = pathlib.Path(sys.argv[2])
+          cargo_home = pathlib.Path(sys.argv[3])
+          if not untrusted_root.is_dir() or trusted_root.exists() or cargo_home.exists():
+              raise SystemExit('bundle roots violate the fresh-directory contract')
+
+          def read_object(path):
+              value = json.loads(path.read_text(encoding='utf-8'))
+              if not isinstance(value, dict):
+                  raise SystemExit('handoff object required')
+              return value
+
+          def exact_keys(value, expected, label):
+              if set(value) != set(expected):
+                  raise SystemExit(f'{label} contains non-allowlisted keys')
+
+          def safe_path(raw, expected_root=None, allow_glob=True):
+              if not isinstance(raw, str) or not raw or '\0' in raw or re.match(r'^[a-z]+://', raw, re.I):
+                  raise SystemExit('invalid bundle path')
+              normalized = raw.replace('\\', '/')
+              if normalized.startswith('/') or normalized.startswith('//') or re.match(r'^[A-Za-z]:/', normalized):
+                  raise SystemExit('absolute bundle path rejected')
+              parts = normalized.split('/')
+              if any(not part or part == '..' or part.startswith('.') for part in parts) or ':' in normalized:
+                  raise SystemExit('dot or empty bundle path segment rejected')
+              if expected_root and parts[0] != expected_root:
+                  raise SystemExit('bundle path outside allowlist')
+              if not allow_glob and re.search(r'[?*\[\]{}]', normalized):
+                  raise SystemExit('glob destination rejected')
+              return '/'.join(parts)
+
+          for entry in untrusted_root.rglob('*'):
+              relative = entry.relative_to(untrusted_root)
+              if any(part.startswith('.') or part in ('.', '..') for part in relative.parts):
+                  raise SystemExit('dot-segment entry rejected')
+              if entry.is_symlink():
+                  raise SystemExit('symlinked handoff entry rejected')
+              if not (entry.is_dir() or entry.is_file()):
+                  raise SystemExit('unsupported handoff entry rejected')
+              if re.fullmatch(r'tauri(?:\.[A-Za-z0-9_-]+)?\.conf\.json', entry.name):
+                  raise SystemExit('untrusted Tauri configuration rejected')
+
+          metadata = read_object(untrusted_root / 'handoff-metadata.json')
+          expected_metadata = {
+              'schema': 2,
+              'artifact': os.environ['ARTIFACT'],
+              'source_commit': os.environ['SOURCE_COMMIT'],
+              'tag': os.environ['TAG'],
+              'binary': 'echo',
+              'target_dir': os.environ['TARGET_DIR'],
+          }
+          if metadata != expected_metadata:
               raise SystemExit('handoff identity mismatch')
-          PY
-          export TRUSTED_BUNDLE_POLICY="$RUNNER_TEMP/trusted-bundle-policy.json"
-          python - <<'PY'
-          import json, os, pathlib
+
+          config = read_object(untrusted_root / 'handoff-bundle-config.json')
+          exact_keys(config, ('productName', 'version', 'identifier', 'icon', 'resources'), 'bundle config')
+          product_name = config['productName']
+          version = config['version']
+          identifier = config['identifier']
+          expected_version = os.environ['TAG'][1:]
+          if not isinstance(product_name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}', product_name):
+              raise SystemExit('invalid product name')
+          if version != expected_version or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?', version):
+              raise SystemExit('invalid bundle version')
+          if not isinstance(identifier, str) or not re.fullmatch(r'[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)+', identifier):
+              raise SystemExit('invalid bundle identifier')
+
+          icons_value = config['icon']
+          if not isinstance(icons_value, list):
+              raise SystemExit('icon allowlist must be a list')
+          icons = [safe_path(value, 'icons') for value in icons_value]
+          resources_value = config['resources']
+          if isinstance(resources_value, list):
+              resources = [safe_path(value, 'resources') for value in resources_value]
+              resource_sources = resources
+          elif isinstance(resources_value, dict):
+              resources = {}
+              resource_sources = []
+              for source, destination in resources_value.items():
+                  normalized_source = safe_path(source, 'resources')
+                  resources[normalized_source] = safe_path(destination, allow_glob=False)
+                  resource_sources.append(normalized_source)
+          else:
+              raise SystemExit('resources allowlist must be a list or object')
+
+          untrusted_tauri = untrusted_root / 'src-tauri'
+          trusted_tauri = trusted_root / 'src-tauri'
+          trusted_tauri.mkdir(parents=True, mode=0o700)
+
+          def copy_entry(source, expected_root):
+              relative = source.relative_to(untrusted_tauri)
+              normalized = safe_path(relative.as_posix(), expected_root)
+              destination = trusted_tauri.joinpath(*normalized.split('/'))
+              if source.is_dir():
+                  destination.mkdir(parents=True, exist_ok=True)
+                  for child in source.iterdir():
+                      copy_entry(child, expected_root)
+              elif source.is_file():
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(source, destination)
+              else:
+                  raise SystemExit('unsupported allowlisted bundle entry')
+
+          def copy_spec(spec, expected_root):
+              pattern = str(untrusted_tauri.joinpath(*spec.split('/')))
+              matches = [pathlib.Path(value) for value in glob.glob(pattern, recursive=True)]
+              if not matches:
+                  raise SystemExit('allowlisted bundle path is missing')
+              for source in sorted(matches, key=lambda value: (len(value.parts), str(value))):
+                  resolved = source.resolve(strict=True)
+                  if not resolved.is_relative_to(untrusted_tauri):
+                      raise SystemExit('allowlisted bundle path escapes src-tauri')
+                  copy_entry(source, expected_root)
+
+          for spec in icons:
+              copy_spec(spec, 'icons')
+          for spec in resource_sources:
+              copy_spec(spec, 'resources')
+
+          target_relative = safe_path(os.environ['TARGET_DIR'])
+          target_source = untrusted_root.joinpath(*target_relative.split('/'))
+          target_destination = trusted_root.joinpath(*target_relative.split('/'))
+          if not target_source.is_dir():
+              raise SystemExit('compiled target directory missing')
+          target_destination.mkdir(parents=True)
+          executable = 'echo.exe' if os.name == 'nt' else 'echo'
+          copied_executable = False
+          for source in target_source.iterdir():
+              if source.is_symlink() or not source.is_file():
+                  raise SystemExit('compiled target contains a non-file entry')
+              mode = stat.S_IMODE(source.stat().st_mode)
+              allowed = source.name == executable or re.search(r'\.(?:exe|dll|dylib|so)$', source.name, re.I) or mode & 0o111
+              if not allowed:
+                  raise SystemExit('compiled target contains a non-allowlisted file')
+              shutil.copy2(source, target_destination / source.name)
+              copied_executable = copied_executable or source.name == executable
+          if not copied_executable:
+              raise SystemExit('compiled application binary missing')
+
+          binary = 'echo'
+          manifest = (
+              f'[package]\nname = {json.dumps(binary)}\nversion = {json.dumps(version)}\n'
+              f'edition = "2021"\ndefault-run = {json.dumps(binary)}\n\n[[bin]]\n'
+              f'name = {json.dumps(binary)}\npath = "src/main.rs"\n\n[dependencies]\ntauri = "2"\n'
+          )
+          (trusted_tauri / 'Cargo.toml').write_text(manifest, encoding='utf-8')
+          (trusted_tauri / 'src').mkdir()
+          (trusted_tauri / 'src/main.rs').write_text('fn main() {}\n', encoding='utf-8')
+
           windows = {
               'certificateThumbprint': None,
-              'nsis': {'template': None, 'installerHooks': None, 'customLanguageFiles': {}}
+              'signCommand': None,
+              'nsis': {'template': None, 'installerHooks': None, 'customLanguageFiles': {}},
+              'wix': {'template': None, 'fragmentPaths': []},
           }
           if os.environ.get('WINDOWS_SIGNING_BACKEND') != 'none':
               windows['signCommand'] = {
                   'cmd': 'pwsh',
                   'args': ['-NoProfile', '-NonInteractive', '-File', os.environ['TRUSTED_SIGN_SCRIPT'], '%1']
               }
-          policy = {
+          trusted_config = {
+              'productName': product_name,
+              'version': version,
+              'identifier': identifier,
               'build': {'beforeBuildCommand': None, 'beforeDevCommand': None, 'beforeBundleCommand': None},
               'bundle': {
+                  'active': True,
                   'createUpdaterArtifacts': True,
-                  'windows': windows
+                  'icon': icons,
+                  'resources': resources,
+                  'windows': windows,
               }
           }
-          pathlib.Path(os.environ['TRUSTED_BUNDLE_POLICY']).write_text(json.dumps(policy), encoding='utf-8')
+          trusted_config_path = trusted_tauri / 'tauri.conf.json'
+          trusted_config_path.write_text(json.dumps(trusted_config), encoding='utf-8')
+
+          for directory in (trusted_root, *trusted_root.parents):
+              if (directory / '.cargo').exists():
+                  raise SystemExit('ambient Cargo project configuration rejected')
+          cargo_home.mkdir(mode=0o700)
+          (cargo_home / 'config.toml').write_text('[net]\ngit-fetch-with-cli = false\n', encoding='utf-8')
+
+          github_env = pathlib.Path(os.environ['GITHUB_ENV'])
+          with github_env.open('a', encoding='utf-8') as output:
+              output.write(f'BUNDLE_ROOT={trusted_root}\n')
+              output.write(f'TRUSTED_BUNDLE_CONFIG={trusted_config_path}\n')
+              output.write(f'CARGO_HOME={cargo_home}\n')
+              output.write(f'CARGO_TARGET_DIR={target_destination}\n')
           PY
-          echo "BUNDLE_ROOT=$bundle_root" >> "$GITHUB_ENV"
-          echo "TRUSTED_BUNDLE_POLICY=$TRUSTED_BUNDLE_POLICY" >> "$GITHUB_ENV"
 
       - name: Validate Windows signing backend and settings
         if: runner.os == 'Windows' && (vars.WINDOWS_SIGNING_BACKEND == 'artifact-signing' || vars.WINDOWS_SIGNING_BACKEND == 'azure-key-vault')
@@ -1011,7 +1199,7 @@ jobs:
           cd "$BUNDLE_ROOT"
           bash "$GITHUB_WORKSPACE/_release-ci/scripts/run-confidential.sh" \
             "$TAURI_CLI" bundle --ci --bundles "${{ matrix.bundles }}" \
-            ${{ matrix.args }} --config "$TRUSTED_BUNDLE_POLICY"
+            ${{ matrix.args }} --config "$TRUSTED_BUNDLE_CONFIG"
 
       - name: Verify enabled Windows signing before upload
         if: runner.os == 'Windows'
