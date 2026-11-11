@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -71,9 +72,14 @@ def release_authority_contract(workflow):
         if forbidden in build:
             raise AssertionError(f'private build retained release authority: {forbidden}')
     for required in ('--no-bundle', 'Upload immutable unsigned platform input',
+                     'handoff-bundle-config.json', "segment.startsWith('.')",
+                     "copyBundleSpec(entry, expectedRoot)",
                      'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'):
         if required not in build:
             raise AssertionError(f'private build is missing isolated handoff step: {required}')
+    for forbidden in ('configNames =', 'copyValues(bundle.externalBin)', 'copyEntry(source);'):
+        if forbidden in build:
+            raise AssertionError(f'private handoff copies non-allowlisted configuration: {forbidden}')
 
     binding = jobs['bind_unsigned_artifacts']
     if 'permissions:\n      contents: read\n      actions: read' not in binding:
@@ -95,7 +101,14 @@ def release_authority_contract(workflow):
                      'ARTIFACT_ID: ${{ needs.bind_unsigned_artifacts.outputs.artifact_id }}',
                      'EXPECTED_DIGEST: ${{ needs.bind_unsigned_artifacts.outputs.artifact_digest }}',
                      'handoff digest mismatch', '$RUNNER_TEMP/platform-handoff',
-                     "'beforeBundleCommand': None", '@tauri-apps/cli@2.10.1',
+                     'Rebuild trusted bundle root from the allowlisted handoff',
+                     "exact_keys(config, ('productName', 'version', 'identifier', 'icon', 'resources')",
+                     'untrusted Tauri configuration rejected',
+                     "if any(part.startswith('.') or part in ('.', '..') for part in relative.parts)",
+                     "'beforeBundleCommand': None", "'signCommand': None",
+                     "output.write(f'CARGO_HOME={cargo_home}\\n')",
+                     "output.write(f'CARGO_TARGET_DIR={target_destination}\\n')",
+                     '--config "$TRUSTED_BUNDLE_CONFIG"', '@tauri-apps/cli@2.10.1',
                      'Bundle and sign without executing private source'):
         if required not in signing:
             raise AssertionError(f'privileged phase is missing a trust-boundary control: {required}')
@@ -261,6 +274,110 @@ class ConfidentialWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.texts = {name: (WORKFLOWS / (name + '.yml')).read_text() for name in ('build', 'pr-check', 'promote-stable')}
 
+    @staticmethod
+    def write_stage_fixture(root, config):
+        (root / '_release-ci').symlink_to(ROOT, target_is_directory=True)
+        tauri = root / 'src-tauri'
+        (tauri / 'icons').mkdir(parents=True)
+        (tauri / 'resources').mkdir()
+        (tauri / 'icons/icon.png').write_bytes(b'icon')
+        (tauri / 'resources/data.txt').write_text('resource')
+        (tauri / 'tauri.conf.json').write_text(json.dumps(config))
+        (tauri / 'tauri.windows.conf.json').write_text(json.dumps({
+            'build': {'beforeBundleCommand': INJECTION},
+            'bundle': {'windows': {'signCommand': INJECTION}},
+        }))
+        target = tauri / 'target/release'
+        target.mkdir(parents=True)
+        executable = target / ('echo.exe' if os.name == 'nt' else 'echo')
+        executable.write_bytes(b'compiled')
+        executable.chmod(0o755)
+
+    def run_stage(self, root, config):
+        self.write_stage_fixture(root, config)
+        runner_temp = root / 'runner-temp'
+        runner_temp.mkdir()
+        handoff = root / 'handoff'
+        program = run_block(self.texts['build'], '- name: Stage bundle-only input without private source')
+        program = program.replace('${{ matrix.artifact }}', 'linux-x64')
+        result = subprocess.run(
+            ['bash', '-e', '-c', program],
+            cwd=root,
+            env={
+                **os.environ,
+                'ARTIFACT': 'linux-x64',
+                'SOURCE_COMMIT': 'a' * 40,
+                'TAG': 'v1.2.3',
+                'TARGET_DIR': 'src-tauri/target/release',
+                'HANDOFF_ROOT': str(handoff),
+                'RUNNER_TEMP': str(runner_temp),
+            },
+            capture_output=True,
+            text=True,
+        )
+        return result, runner_temp / 'unsigned-linux-x64.tar.gz'
+
+    @staticmethod
+    def write_privileged_fixture(root, bundle_config=None):
+        runner_temp = root / 'runner-temp'
+        bundle_root = runner_temp / 'platform-handoff/bundle-input'
+        tauri = bundle_root / 'src-tauri'
+        (tauri / 'icons').mkdir(parents=True)
+        (tauri / 'resources').mkdir()
+        (tauri / 'icons/icon.png').write_bytes(b'icon')
+        (tauri / 'resources/data.txt').write_text('resource')
+        target = tauri / 'target/release'
+        target.mkdir(parents=True)
+        executable = target / ('echo.exe' if os.name == 'nt' else 'echo')
+        executable.write_bytes(b'compiled')
+        executable.chmod(0o755)
+        (bundle_root / 'handoff-metadata.json').write_text(json.dumps({
+            'schema': 2,
+            'artifact': 'linux-x64',
+            'source_commit': 'a' * 40,
+            'tag': 'v1.2.3',
+            'binary': 'echo',
+            'target_dir': 'src-tauri/target/release',
+        }))
+        if bundle_config is None:
+            bundle_config = {
+                'productName': 'Echo',
+                'version': '1.2.3',
+                'identifier': 'ai.subunit.echo',
+                'icon': ['icons/icon.png'],
+                'resources': {'resources/data.txt': 'assets/data.txt'},
+            }
+        (bundle_root / 'handoff-bundle-config.json').write_text(json.dumps(bundle_config))
+        system_temp = root / 'system-temp'
+        system_temp.mkdir()
+        return runner_temp, bundle_root, system_temp
+
+    def run_rebuilder(self, root):
+        runner_temp = root / 'runner-temp'
+        system_temp = root / 'system-temp'
+        github_env = root / 'github-env'
+        program = run_block(self.texts['build'], '- name: Rebuild trusted bundle root from the allowlisted handoff')
+        result = subprocess.run(
+            ['bash', '-e', '-c', program],
+            cwd=root,
+            env={
+                **os.environ,
+                'RUNNER_TEMP': str(runner_temp),
+                'TMPDIR': str(system_temp),
+                'GITHUB_ENV': str(github_env),
+                'GITHUB_WORKSPACE': str(ROOT),
+                'ARTIFACT': 'linux-x64',
+                'SOURCE_COMMIT': 'a' * 40,
+                'TAG': 'v1.2.3',
+                'TARGET_DIR': 'src-tauri/target/release',
+                'TRUSTED_SIGN_SCRIPT': str(ROOT / 'scripts/sign-windows.ps1'),
+                'WINDOWS_SIGNING_BACKEND': 'none',
+            },
+            capture_output=True,
+            text=True,
+        )
+        return result, github_env
+
     def test_private_build_release_authority_split_and_mutations(self):
         jobs = release_authority_contract(self.texts['build'])
         self.assertIn('permissions:\n      contents: read', jobs['build_unsigned'])
@@ -298,6 +415,136 @@ class ConfidentialWorkflowTests(unittest.TestCase):
         mutated = self.texts['build'].replace('handoff digest mismatch', 'handoff integrity failure', 1)
         with self.assertRaises(AssertionError):
             release_authority_contract(mutated)
+
+        for boundary in (
+            "segment.startsWith('.')",
+            "exact_keys(config, ('productName', 'version', 'identifier', 'icon', 'resources')",
+            'untrusted Tauri configuration rejected',
+            "if any(part.startswith('.') or part in ('.', '..') for part in relative.parts)",
+            "'signCommand': None",
+            "output.write(f'CARGO_HOME={cargo_home}\\n')",
+            "output.write(f'CARGO_TARGET_DIR={target_destination}\\n')",
+            '--config "$TRUSTED_BUNDLE_CONFIG"',
+        ):
+            with self.subTest(boundary=boundary):
+                mutated = self.texts['build'].replace(boundary, 'REMOVED_SECURITY_BOUNDARY', 1)
+                with self.assertRaises(AssertionError):
+                    release_authority_contract(mutated)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node required for bundle handoff validation')
+    def test_unprivileged_handoff_exports_only_allowlisted_config_and_paths(self):
+        config = {
+            'productName': 'Echo',
+            'version': '1.2.3',
+            'identifier': 'ai.subunit.echo',
+            'mainBinaryName': 'attacker-controlled-name',
+            'build': {'beforeBundleCommand': INJECTION},
+            'bundle': {
+                'icon': ['icons/icon.png'],
+                'resources': ['resources/**/*'],
+                'externalBin': ['resources/attacker'],
+                'windows': {'signCommand': INJECTION},
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            result, archive_path = self.run_stage(Path(temporary), config)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with tarfile.open(archive_path, 'r:gz') as archive:
+                names = set(archive.getnames())
+                self.assertFalse(any(re.search(r'tauri(?:\.[^.]+)?\.conf\.json$', name) for name in names))
+                self.assertIn('bundle-input/src-tauri/icons/icon.png', names)
+                self.assertIn('bundle-input/src-tauri/resources/data.txt', names)
+                member = archive.extractfile('bundle-input/handoff-bundle-config.json')
+                self.assertIsNotNone(member)
+                allowlist = json.loads(member.read())
+            self.assertEqual(set(allowlist), {'productName', 'version', 'identifier', 'icon', 'resources'})
+            self.assertEqual(allowlist['icon'], ['icons/icon.png'])
+            self.assertEqual(allowlist['resources'], ['resources/**/*'])
+            self.assertNotIn(CANARY, json.dumps(allowlist))
+
+    @unittest.skipUnless(shutil.which('node'), 'Node required for bundle handoff validation')
+    def test_unprivileged_handoff_rejects_parent_and_dot_segments(self):
+        cases = {
+            'parent': {'icon': ['icons/../.cargo/config.toml'], 'resources': []},
+            'dot prefix': {'icon': ['./icons/icon.png'], 'resources': []},
+            'hidden root': {'icon': ['.cargo/config.toml'], 'resources': []},
+            'hidden nested': {'icon': ['icons/.cargo/config.toml'], 'resources': []},
+            'windows parent': {'icon': [r'icons\..\.cargo\config.toml'], 'resources': []},
+            'outside allowlist': {'icon': ['resources/data.txt'], 'resources': []},
+            'resource destination': {'icon': [], 'resources': {'resources/data.txt': '../escape'}},
+        }
+        for label, bundle in cases.items():
+            config = {
+                'productName': 'Echo',
+                'version': '1.2.3',
+                'identifier': 'ai.subunit.echo',
+                'bundle': bundle,
+            }
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                result, archive_path = self.run_stage(Path(temporary), config)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(archive_path.exists())
+
+    def test_privileged_rebuilder_creates_minimal_config_and_isolated_cargo_home(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_privileged_fixture(root)
+            result, github_env = self.run_rebuilder(root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            exported = dict(line.split('=', 1) for line in github_env.read_text().splitlines())
+            trusted_root = Path(exported['BUNDLE_ROOT'])
+            trusted_config = json.loads(Path(exported['TRUSTED_BUNDLE_CONFIG']).read_text())
+            self.assertEqual(set(trusted_config), {'productName', 'version', 'identifier', 'build', 'bundle'})
+            self.assertEqual(trusted_config['build'], {
+                'beforeBuildCommand': None,
+                'beforeDevCommand': None,
+                'beforeBundleCommand': None,
+            })
+            self.assertIsNone(trusted_config['bundle']['windows']['signCommand'])
+            self.assertEqual(trusted_config['bundle']['icon'], ['icons/icon.png'])
+            self.assertEqual(trusted_config['bundle']['resources'], {'resources/data.txt': 'assets/data.txt'})
+            self.assertFalse(any(path.name.startswith('tauri.') and path.name != 'tauri.conf.json'
+                                 for path in trusted_root.rglob('*')))
+            self.assertFalse((trusted_root / '.cargo').exists())
+            cargo_home = Path(exported['CARGO_HOME'])
+            self.assertFalse(cargo_home.is_relative_to(trusted_root))
+            self.assertEqual((cargo_home / 'config.toml').read_text(), '[net]\ngit-fetch-with-cli = false\n')
+            self.assertTrue(Path(exported['CARGO_TARGET_DIR']).is_relative_to(trusted_root))
+
+    def test_privileged_rebuilder_rejects_config_and_path_injection_mutations(self):
+        def raw_tauri(root, bundle_root):
+            (bundle_root / 'src-tauri/tauri.conf.json').write_text(json.dumps({'build': {'beforeBundleCommand': INJECTION}}))
+
+        def cargo_config(root, bundle_root):
+            cargo = bundle_root / '.cargo'
+            cargo.mkdir()
+            (cargo / 'config.toml').write_text('[build]\nrustc-wrapper="attacker"\n')
+
+        def extra_config_key(root, bundle_root):
+            path = bundle_root / 'handoff-bundle-config.json'
+            value = json.loads(path.read_text())
+            value['build'] = {'beforeBundleCommand': INJECTION}
+            path.write_text(json.dumps(value))
+
+        def parent_resource(root, bundle_root):
+            path = bundle_root / 'handoff-bundle-config.json'
+            value = json.loads(path.read_text())
+            value['resources'] = ['resources/../.cargo/config.toml']
+            path.write_text(json.dumps(value))
+
+        for label, mutate in (
+            ('raw tauri config', raw_tauri),
+            ('cargo config', cargo_config),
+            ('extra config key', extra_config_key),
+            ('parent resource', parent_resource),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                _, bundle_root, _ = self.write_privileged_fixture(root)
+                mutate(root, bundle_root)
+                result, github_env = self.run_rebuilder(root)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(github_env.exists())
 
     def test_contract_and_every_individual_unwrapped_boundary_mutation(self):
         expected = confidential_contract(self.texts)

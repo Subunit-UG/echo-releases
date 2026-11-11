@@ -85,3 +85,36 @@ Lokale Verifikation nach der Anpassung:
 
 An Workflow-Dateien oder `tests/test_confidential_output.py` wurde in diesem Nachtrag nichts geändert. Es wurde nichts gelöscht.
 
+## Runde 3: Rest-Vertrauensgrenzen
+
+### Finding 1 — Allowlist-Config statt untrusted Tauri-Config
+
+Der unprivilegierte Job liest nur noch die primäre `src-tauri/tauri.conf.json` als untrusted Datenquelle und exportiert daraus einen kleinen Übergabevertrag mit genau fünf Feldern: `productName`, `version`, `identifier`, `icon` und `resources`. `tauri.*.conf.json`-Overlays, Build-Hooks, `externalBin`, Plattform-Templates, Entitlements und alle übrigen Konfigurationsfelder werden nicht mehr in das Handoff kopiert.
+
+Der privilegierte Job verwendet auch diesen kleinen Vertrag nicht unmittelbar. Er prüft Identität, Version, Schlüsselmenge, Typen und Pfade erneut, verwirft jedes mitgelieferte `tauri*.conf.json` und rekonstruiert unter einem frischen System-Temp-Pfad einen neuen Bundle-Baum. Dort erzeugt er selbst die einzige `src-tauri/tauri.conf.json`. Die Config enthält ausschließlich die validierte Produktidentität sowie Icon-/Resource-Pfade; `beforeBuildCommand`, `beforeDevCommand` und `beforeBundleCommand` sind `null`. Windows-NSIS-/WiX-Kontrollpfade sind neutralisiert. `bundle.windows.signCommand` wird immer vom vertrauenswürdigen Workflow gesetzt: `null` beim Backend `none`, andernfalls ausschließlich der fest vorgegebene öffentliche Signierpfad.
+
+### Finding 2 — Pfad-Ablehnung und isoliertes Cargo
+
+Icon- und Resource-Quellen sind auf die bekannten Wurzeln `src-tauri/icons` und `src-tauri/resources` begrenzt. Beide Seiten der Übergabe lehnen absolute Pfade, URLs, Laufwerkspfade, leere Segmente, `..`, jedes mit `.` beginnende Segment, Doppelseparatoren, Doppelpunkte und Symlinks fail-closed ab. Resource-Zielpfade werden ebenfalls geprüft; Ziel-Globs sind verboten. Der privilegierte Rekonstruktionsschritt scannt zusätzlich den tatsächlichen extrahierten Baum und übernimmt nur die erneut validierten Dateien sowie erlaubte kompilierte Zielartefakte.
+
+Der Bundler läuft nicht mehr im extrahierten Handoff, sondern im frisch rekonstruierten Bundle-Baum. `CARGO_HOME` zeigt auf ein separates, neu erzeugtes Verzeichnis mit eigener vertrauenswürdiger `config.toml`; `CARGO_TARGET_DIR` zeigt explizit auf das rekonstruierte Target. Vor dem Bundle-Lauf wird außerdem jeder lokale `.cargo`-Konfigurationspfad im Bundle-Baum und seinen System-Temp-Vorfahren abgelehnt. Die Tauri-CLI erhält ausschließlich die neu erzeugte Config über `--config "$TRUSTED_BUNDLE_CONFIG"`.
+
+### Erweiterte Mauer und lokaler Nachweis
+
+`tests/test_confidential_output.py` enthält jetzt 17 Tests. Neu abgedeckt sind:
+
+- ein vollständiger Handoff-Probelauf, der beweist, dass Overlay-, Hook-, `signCommand`-, `externalBin`- und `mainBinaryName`-Inhalte nicht in Zone 3 gelangen;
+- Negativfälle für POSIX- und Windows-`..`-Pfade, führende und verschachtelte Punkt-Segmente, falsche Wurzeln sowie traversierende Resource-Ziele;
+- ein vollständiger privilegierter Rekonstruktionslauf, der die minimale Config, neutralisierte Kommandofelder, den frischen Bundle-Baum, das separate `CARGO_HOME` und das explizite `CARGO_TARGET_DIR` prüft;
+- Negativfälle für rohe Tauri-Configs, `.cargo/config.toml`, zusätzliche Config-Schlüssel und manipulierte Resource-Pfade im Handoff;
+- Mutationsproben: Entfernen der Pfadwächter, der exakten Allowlist, der `signCommand`-Neutralisierung, der Cargo-Isolation oder des vertrauenswürdigen `--config`-Pfads macht den Vertragstest rot.
+
+Verifikation auf dem Endstand dieser Runde:
+
+- `python3 tests/test_confidential_output.py` — **grün: 17 Tests**.
+- `python3 tests/test_release_workflow.py` — **grün: 44 Tests**.
+- `actionlint .github/workflows/build.yml` — **grün**.
+- `git diff --check` — **grün**.
+
+Die drei Zonen und ihre Berechtigungen wurden nicht zusammengelegt oder erweitert. `tests/test_release_workflow.py` musste nicht geändert werden. Kein Workflow, Hosted Runner oder Release wurde ausgelöst; Plattform-Bundling und Signierung bleiben daher bis zum vorgesehenen Gate-/Draft-Probelauf lokal strukturell und verhaltensnah, aber nicht auf Hosted Runnern nachgewiesen.
+
