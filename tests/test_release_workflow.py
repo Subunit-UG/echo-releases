@@ -147,15 +147,19 @@ class ReleaseWorkflowContract(unittest.TestCase):
         self.assertNotIn("gh release upload", workflow)
 
     def test_matrix_uploads_only_to_reserved_release_id(self) -> None:
+        unsigned_build = workflow_job_block("build_unsigned")
+        signing_build = workflow_job_block("build")
         self.assertIn("reserve:\n    needs: prepare", WORKFLOW)
-        self.assertIn("releaseId: ${{ needs.reserve.outputs.release_id }}", WORKFLOW)
+        self.assertIn("releaseId: ${{ needs.reserve.outputs.release_id }}", signing_build)
         self.assertNotIn('releaseName: "Echo ${{ needs.prepare.outputs.tag }}"', WORKFLOW)
-        self.assertRegex(
-            WORKFLOW,
-            r"build:\n\s+needs: \[prepare, reserve\]",
+        self.assertIn(
+            "needs: [prepare, reserve, bind_unsigned_artifacts]",
+            signing_build,
         )
+        self.assertIn("RELEASE_ID: ${{ needs.reserve.outputs.release_id }}", signing_build)
+        self.assertIn('"$REPO" "$RELEASE_ID" "$name"', signing_build)
         self.assertIn("source_commit: ${{ steps.source.outputs.commit }}", WORKFLOW)
-        self.assertIn('[ "$(git rev-parse HEAD)" = "$SOURCE_COMMIT" ]', WORKFLOW)
+        self.assertIn('[ "$(git rev-parse HEAD)" = "$SOURCE_COMMIT" ]', unsigned_build)
         self.assertIn('[ "$(git -C _source rev-parse HEAD)" = "$SOURCE_COMMIT" ]', WORKFLOW)
 
     def test_apple_signing_secrets_only_reach_the_main_bound_release_environment(self) -> None:
@@ -1189,12 +1193,22 @@ class MacOSRunnerContract(unittest.TestCase):
 
     def test_one_current_macos_runner_and_no_stale_platform_condition(self) -> None:
         self.assertEqual(macos_runner_errors(self.texts), [])
-        build = self.texts["build.yml"]
-        self.assertGreaterEqual(build.count("matrix.platform == 'macos-15'"), 6)
+        unsigned_build = workflow_job_block("build_unsigned")
+        signing_build = workflow_job_block("build")
+        unsigned_hosts = re.findall(r"^          - platform: (\S+)$", unsigned_build, re.M)
+        signing_hosts = re.findall(r"^          - runner: (\S+)$", signing_build, re.M)
+        self.assertEqual(unsigned_hosts, ["ubuntu-24.04", "windows-latest", "windows-11-arm", "macos-15"])
+        self.assertEqual(signing_hosts, ["ubuntu-24.04", "windows-latest", "windows-11-arm", "macos-15"])
+        self.assertEqual([host for host in signing_hosts if host.startswith("macos-")], ["macos-15"])
+        self.assertNotIn("matrix.platform", signing_build)
+        self.assertIn("matrix.runner == 'macos-15'", signing_build)
+        self.assertIn('elif [ "${{ matrix.runner }}" = macos-15 ]; then', signing_build)
         self.assertIn("runs-on: macos-15", self.texts["promote-stable.yml"])
-        self.assertIn("xcode_app=/Applications/Xcode_16.4.app", build)
-        self.assertIn('sudo xcode-select -s "$xcode_app/Contents/Developer"', build)
-        self.assertIn('echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"', build)
+        for job in (unsigned_build, signing_build):
+            with self.subTest(job=job.split(":", 1)[0].strip()):
+                self.assertIn("xcode_app=/Applications/Xcode_16.4.app", job)
+                self.assertIn('sudo xcode-select -s "$xcode_app/Contents/Developer"', job)
+        self.assertIn('echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"', unsigned_build)
 
     def test_each_partial_runner_switch_is_detected(self) -> None:
         build = self.texts["build.yml"]
