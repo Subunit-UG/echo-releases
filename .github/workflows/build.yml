@@ -1207,7 +1207,7 @@ jobs:
       # CFBundleIconName. Tauri skips that step with only a log line when the
       # toolchain cannot produce it, and the app silently shows the legacy icon.
       - name: Verify macOS app icon (Assets.car and CFBundleIconName)
-        if: matrix.platform == 'macos-15'
+        if: matrix.runner == 'macos-15'
         shell: bash
         run: |
           set -euo pipefail

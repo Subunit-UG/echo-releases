@@ -1278,10 +1278,13 @@ class MacOSAppIconContract(unittest.TestCase):
         )
         self.assertIsNotNone(step)
         text = step.group(0)
-        self.assertIn("        if: matrix.platform == 'macos-15'\n", text)
+        self.assertIn("        if: matrix.runner == 'macos-15'\n", text)
         self.assertNotIn("vars.", text)
-        self.assertIn("python3 _release-ci/scripts/verify-macos-app-icon.py src-tauri/tauri.conf.json \"$app\"", text)
-        self.assertLess(WORKFLOW.index("uses: ./_release-ci/.github/actions/confidential-tauri"), step.start())
+        self.assertIn('root="$BUNDLE_ROOT/${{ matrix.target_dir }}/bundle"', text)
+        self.assertIn("python3 _release-ci/scripts/verify-macos-app-icon.py \"$BUNDLE_ROOT/src-tauri/tauri.conf.json\" \"$app\"", text)
+        signing_build = workflow_job_block("build")
+        self.assertIn(step.group(0), signing_build)
+        self.assertLess(signing_build.index("- name: Bundle and sign without executing private source"), signing_build.index(step.group(0)))
         self.assertIn('"scripts/verify-macos-app-icon.py"', CONTRACT_WORKFLOW)
         probe = re.search(
             r"(?ms)^      - name: Pinned Xcode verifies a macOS 26 system icon \(same pin as build\.yml\)\n.*?(?=^      - |\Z)",
