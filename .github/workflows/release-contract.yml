@@ -101,8 +101,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pin=$(sed -n 's|^ *xcode_app=\(/Applications/Xcode_[0-9.]*\.app\)$|\1|p' .github/workflows/build.yml)
-          [ -n "$pin" ] || { echo "::error::Xcode-Pin in build.yml nicht gefunden"; exit 1; }
+          pins=$(sed -n 's|^ *xcode_app=\(/Applications/Xcode_[0-9.]*\.app\)$|\1|p' .github/workflows/build.yml | sort -u)
+          [ -n "$pins" ] || { echo "::error::Xcode-Pin in build.yml nicht gefunden"; exit 1; }
+          [ "$(printf '%s\n' "$pins" | wc -l | tr -d ' ')" = 1 ] || { echo "::error::Build-Zonen verwenden unterschiedliche Xcode-Pins"; exit 1; }
+          pin=$pins
           ls -d /Applications/Xcode*.app
           [ -d "$pin" ] || { echo "::error::$pin fehlt im Runner-Image macos-15"; exit 1; }
           DEVELOPER_DIR="$pin/Contents/Developer" xcodebuild -version
@@ -113,8 +115,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pin=$(sed -n 's|^ *xcode_app=\(/Applications/Xcode_[0-9.]*\.app\)$|\1|p' .github/workflows/build.yml)
-          [ -n "$pin" ] || { echo "::error::Xcode-Pin in build.yml nicht gefunden"; exit 1; }
+          pins=$(sed -n 's|^ *xcode_app=\(/Applications/Xcode_[0-9.]*\.app\)$|\1|p' .github/workflows/build.yml | sort -u)
+          [ -n "$pins" ] || { echo "::error::Xcode-Pin in build.yml nicht gefunden"; exit 1; }
+          [ "$(printf '%s\n' "$pins" | wc -l | tr -d ' ')" = 1 ] || { echo "::error::Build-Zonen verwenden unterschiedliche Xcode-Pins"; exit 1; }
+          pin=$pins
           DEVELOPER_DIR="$pin/Contents/Developer" python3 scripts/verify-macos-app-icon.py \
             tests/fixtures/app-icon/tauri.conf.json tests/fixtures/app-icon/Fixture.app
       - name: Prepare public fixture
