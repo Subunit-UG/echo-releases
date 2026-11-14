@@ -1173,6 +1173,13 @@ def macos_runner_errors(texts: dict[str, str]) -> list[str]:
     errors: list[str] = []
     if mac[0] in RETIRED_MACOS_RUNNERS:
         errors.append(f"build.yml: macOS host {mac[0]} is a retired runner image")
+    xcode_pins = re.findall(
+        r"^\s*xcode_app=(/Applications/Xcode_[0-9.]+\.app)$",
+        texts["build.yml"],
+        re.M,
+    )
+    if len(xcode_pins) != 2 or len(set(xcode_pins)) != 1:
+        errors.append(f"build.yml: both build zones must use one Xcode pin, got {xcode_pins}")
     for name, text in texts.items():
         code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
         for label in sorted(set(re.findall(r"\bmacos-(?:latest|\d+)\b", code)) - {mac[0]}):
@@ -1208,6 +1215,10 @@ class MacOSRunnerContract(unittest.TestCase):
             with self.subTest(job=job.split(":", 1)[0].strip()):
                 self.assertIn("xcode_app=/Applications/Xcode_16.4.app", job)
                 self.assertIn('sudo xcode-select -s "$xcode_app/Contents/Developer"', job)
+        contract = self.texts["release-contract.yml"]
+        self.assertEqual(contract.count("| sort -u)"), 2)
+        self.assertEqual(contract.count("Build-Zonen verwenden unterschiedliche Xcode-Pins"), 2)
+        self.assertEqual(contract.count("pin=$pins"), 2)
         self.assertIn('echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"', unsigned_build)
 
     def test_each_partial_runner_switch_is_detected(self) -> None:
@@ -1220,6 +1231,11 @@ class MacOSRunnerContract(unittest.TestCase):
                 "runs-on: macos-15", "runs-on: macos-14")),
             "hosted proof on another runner": ("release-contract.yml", self.texts["release-contract.yml"].replace(
                 "macos-15", "macos-latest")),
+            "abweichender Xcode-Pin zwischen Build-Zonen": ("build.yml", build.replace(
+                "xcode_app=/Applications/Xcode_16.4.app",
+                "xcode_app=/Applications/Xcode_16.3.app",
+                1,
+            )),
         }
         for label, (name, mutated) in mutations.items():
             with self.subTest(label=label):
