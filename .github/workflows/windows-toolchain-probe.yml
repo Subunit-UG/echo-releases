@@ -105,7 +105,9 @@ jobs:
           Get-ChildItem "$vs\VC\Auxiliary\Build" -Filter 'Microsoft.VCToolsVersion*.txt' | ForEach-Object { "$($_.Name): $(Get-Content $_.FullName)" }
           foreach ($arch in 'x64', 'ARM64') {
             $c = "$vs\VC\Tools\Llvm\$arch\bin\clang-cl.exe"
-            if (Test-Path $c) { "VS clang-cl ($arch): $(& $c --version | Select-Object -First 1)" }
+            if (Test-Path $c) {
+              try { "VS clang-cl ($arch): $(& $c --version | Select-Object -First 1)" } catch { "VS clang-cl ($arch): not runnable on this host" }
+            }
           }
           "PATH clang-cl: $((Get-Command clang-cl).Source)"
           clang-cl --version
