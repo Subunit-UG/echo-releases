@@ -1317,5 +1317,103 @@ class MacOSAppIconContract(unittest.TestCase):
             self.verifier.verify(self.conf, self.app, self.assetutil)
 
 
+WINDOWS_PROBE_DIR = ROOT / "tests" / "fixtures" / "windows-native-probe"
+WINDOWS_TOOLCHAIN_CONDITION = re.compile(r"^        if: matrix\.platform == 'windows-(?:latest|11-arm)'\n", re.M)
+
+
+def job_block(workflow: str, job: str) -> str:
+    match = re.search(rf"(?ms)^  {re.escape(job)}:\n.*?(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow)
+    if match is None:
+        raise AssertionError(f"workflow job not found: {job}")
+    return match.group(0)
+
+
+def windows_toolchain_steps(workflow: str, job: str) -> list[str]:
+    """Windows toolchain setup steps of a job, without comment and blank lines."""
+    steps = re.findall(r"(?ms)^      - .*?(?=^      - |\Z)", job_block(workflow, job))
+    return [
+        "\n".join(line for line in step.splitlines() if line.strip() and not line.lstrip().startswith("#"))
+        for step in steps
+        if WINDOWS_TOOLCHAIN_CONDITION.search(step)
+    ]
+
+
+def windows_toolchain_errors(build: str, contract: str) -> list[str]:
+    """The public probe must replay exactly the Windows toolchain of the release build."""
+    errors: list[str] = []
+    release = windows_toolchain_steps(build, "build")
+    probe = windows_toolchain_steps(contract, "windows-native-toolchain")
+    if len(release) < 6:
+        errors.append(f"build.yml: expected the six Windows toolchain steps, found {len(release)}")
+    if release != probe:
+        errors.append("release-contract.yml: Windows toolchain steps differ from build.yml")
+    llvm = re.findall(
+        r'releases/download/llvmorg-([0-9.]+)/LLVM-([0-9.]+)-(win64|woa64)\.exe"[^\n]*\n'
+        r'\s*\$sha = \(Get-FileHash -Algorithm SHA256 \$llvm\)\.Hash\.ToLower\(\)\n'
+        r'\s*if \(\$sha -ne "([0-9a-f]{64})"\) \{ throw',
+        build,
+    )
+    if sorted(arch for *_, arch, _ in llvm) != ["win64", "woa64"]:
+        errors.append(f"build.yml: expected one hash-pinned LLVM installer per Windows job, got {llvm}")
+    versions = {version for tag, version, _, _ in llvm} | {tag for tag, *_ in llvm}
+    if len(versions) != 1:
+        errors.append(f"build.yml: Windows jobs pin different LLVM versions {sorted(versions)}")
+    for version in versions:
+        expected = "'^clang version " + version.replace(".", r"\.") + r"(\s|$)'"
+        if build.count(expected) != 2:
+            errors.append(f"build.yml: both Windows jobs must assert that LLVM {version} is active")
+    if "choco install llvm" in build:
+        errors.append("build.yml: Chocolatey LLVM is unpinned and keeps the image's version")
+    return errors
+
+
+class WindowsToolchainContract(unittest.TestCase):
+    def test_probe_replays_the_release_toolchain(self) -> None:
+        self.assertEqual(windows_toolchain_errors(WORKFLOW, CONTRACT_WORKFLOW), [])
+
+    def test_each_toolchain_drift_is_detected(self) -> None:
+        mutations = {
+            "release LLVM bumped without the probe": (WORKFLOW.replace("22.1.8", "22.1.9"), CONTRACT_WORKFLOW),
+            "probe LLVM differs": (WORKFLOW, CONTRACT_WORKFLOW.replace("LLVM-22.1.8-woa64.exe", "LLVM-22.1.7-woa64.exe", 1)),
+            "one job on another LLVM": (WORKFLOW.replace("llvmorg-22.1.8/LLVM-22.1.8-woa64", "llvmorg-20.1.8/LLVM-20.1.8-woa64"), CONTRACT_WORKFLOW),
+            "installer hash dropped": (re.sub(r'if \(\$sha -ne "[0-9a-f]{64}"\) \{ throw "LLVM', 'if ($false) { throw "LLVM', WORKFLOW, count=1), CONTRACT_WORKFLOW),
+            "active version not asserted": (WORKFLOW.replace(r"'^clang version 22\.1\.8(\s|$)'", "'clang'", 1), CONTRACT_WORKFLOW),
+            "image LLVM via Chocolatey": (WORKFLOW.replace("choco install cmake ninja", "choco install llvm cmake ninja", 1), CONTRACT_WORKFLOW),
+            "probe skips a toolchain step": (WORKFLOW, CONTRACT_WORKFLOW.replace("if: matrix.platform == 'windows-11-arm'\n        uses: ilammy", "if: false\n        uses: ilammy", 1)),
+        }
+        for label, (build, contract) in mutations.items():
+            with self.subTest(label):
+                self.assertNotEqual(windows_toolchain_errors(build, contract), [], label)
+
+    def test_release_checks_the_stl_with_the_public_probe_before_the_private_build(self) -> None:
+        step = re.search(
+            r"(?ms)^      - name: Windows compilers accept the runner's MSVC STL \(public probe file\)\n.*?(?=^      - |^      # |\Z)",
+            WORKFLOW,
+        )
+        self.assertIsNotNone(step)
+        text = step.group(0)
+        self.assertIn("        if: runner.os == 'Windows'\n", text)
+        self.assertIn("working-directory: _release-ci/tests/fixtures/windows-native-probe", text)
+        self.assertIn("foreach ($compiler in 'clang-cl', 'cl')", text)
+        self.assertNotIn("secrets.", text)
+        self.assertLess(WORKFLOW.index("path: _release-ci\n"), step.start())
+        self.assertLess(step.start(), WORKFLOW.index("uses: ./_release-ci/.github/actions/confidential-tauri"))
+        self.assertTrue((WINDOWS_PROBE_DIR / "stl_smoke.cpp").is_file())
+
+    def test_probe_job_is_public_and_triggered_by_its_inputs(self) -> None:
+        job = job_block(CONTRACT_WORKFLOW, "windows-native-toolchain")
+        self.assertNotRegex(job, r"secrets\.|environment:|id-token|contents: write")
+        self.assertIn("persist-credentials: false", job)
+        self.assertIn("working-directory: tests/fixtures/windows-native-probe", job)
+        self.assertIn("'build', '--release', '--locked'", job)
+        self.assertEqual(CONTRACT_WORKFLOW.count('"tests/fixtures/windows-native-probe/**"'), 2)
+        manifest = (WINDOWS_PROBE_DIR / "Cargo.toml").read_text(encoding="utf-8")
+        lock = (WINDOWS_PROBE_DIR / "Cargo.lock").read_text(encoding="utf-8")
+        for crate, version in (("whisper-rs", "0.16.0"), ("whisper-rs-sys", "0.15.0"), ("opusic-sys", "0.7.3")):
+            self.assertIn(f'{crate} = "={version}"', manifest)
+            self.assertIn(f'name = "{crate}"\nversion = "{version}"', lock)
+        self.assertIn('gpu = ["whisper-rs/vulkan"]', manifest)
+
+
 if __name__ == "__main__":
     unittest.main()

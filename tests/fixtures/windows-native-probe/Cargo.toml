@@ -1,0 +1,25 @@
+# Public probe for the Windows release toolchain. It builds the same native
+# crates (whisper.cpp/ggml through whisper-rs-sys, libopus through opusic-sys)
+# with the same build helpers at the same versions as the release build, but
+# contains no application code. Cargo.lock pins every transitive version.
+[package]
+name = "windows-native-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+whisper-rs = "=0.16.0"
+whisper-rs-sys = "=0.15.0"
+opusic-sys = "=0.7.3"
+
+[build-dependencies]
+bindgen = "=0.72.1"
+cc = "=1.2.62"
+clang-sys = "=1.8.1"
+cmake = "=0.1.58"
+
+[features]
+gpu = ["whisper-rs/vulkan"]
+
+[workspace]
