@@ -1,0 +1,152 @@
+name: windows-toolchain-probe
+
+# Temporary diagnosis: replays the Windows toolchain setup of build.yml on the
+# current runner images and builds only public crates (no private source,
+# no secrets, no release).
+on:
+  push:
+    branches: [ci/windows-toolchain-20261111]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            features: gpu
+          - platform: windows-11-arm
+            features: ""
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # ---- identical to build.yml (Windows steps) ----
+      - name: LLVM x64 + CMake + Ninja (Windows x64)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install llvm cmake ninja --no-progress -y --installargs 'ADD_CMAKE_TO_PATH=System'
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Vulkan SDK (Windows x64, GPU whisper — keep glslc for shader gen)
+        if: matrix.platform == 'windows-latest'
+        uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # v1
+        with:
+          vulkan_version: 1.3.296.0
+          install_runtime: true
+          cache: true
+          stripdown: false
+
+      - name: glslc on PATH (Windows x64)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: '"$env:VULKAN_SDK\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append'
+
+      - name: MSVC env (Windows x64 — Ninja needs cl + INCLUDE/LIB in the job env)
+        if: matrix.platform == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
+      - name: ARM64 LLVM + CMake + Ninja (Windows ARM — choco LLVM is x64)
+        if: matrix.platform == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-woa64.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm-arm64.exe"
+          Start-Process -FilePath "$env:RUNNER_TEMP\llvm-arm64.exe" -ArgumentList '/S' -Wait
+          & "C:\Program Files\LLVM\bin\clang-cl.exe" --version
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          $cmakeZip = "$env:RUNNER_TEMP\cmake-x64.zip"
+          Invoke-WebRequest -Uri "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-x86_64.zip" -OutFile $cmakeZip
+          $sha = (Get-FileHash -Algorithm SHA256 $cmakeZip).Hash.ToLower()
+          if ($sha -ne "bace36e94b31c68ab6fa295f26dfa11219e0701cf7c94b0284a7d1cb13dac536") { throw "CMake download hash mismatch: $sha" }
+          Expand-Archive -Path $cmakeZip -DestinationPath "$env:RUNNER_TEMP\cmake" -Force
+          $cmakeBin = "$env:RUNNER_TEMP\cmake\cmake-4.4.4-windows-x86_64\bin"
+          & "$cmakeBin\cmake.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "CMake 4.4.4 not runnable" }
+          "$cmakeBin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          choco install ninja --no-progress -y
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { throw "ninja missing" }
+          "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CC=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CXX=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CXXFLAGS=/EHsc" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "GGML_CPU_AARCH64=OFF" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "GGML_CPU_REPACK=OFF" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: MSVC env for clang-cl (Windows ARM — INCLUDE/LIB for the ARM64 MSVC CRT)
+        if: matrix.platform == 'windows-11-arm'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: arm64
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      # ---- end of build.yml copy ----
+
+      - name: Toolchain inventory
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          "VS: $vs"
+          Get-ChildItem "$vs\VC\Tools\MSVC" -Directory | ForEach-Object { "MSVC toolset dir: $($_.Name)" }
+          Get-ChildItem "$vs\VC\Auxiliary\Build" -Filter 'Microsoft.VCToolsVersion*.txt' | ForEach-Object { "$($_.Name): $(Get-Content $_.FullName)" }
+          foreach ($arch in 'x64', 'ARM64') {
+            $c = "$vs\VC\Tools\Llvm\$arch\bin\clang-cl.exe"
+            if (Test-Path $c) { "VS clang-cl ($arch): $(& $c --version | Select-Object -First 1)" }
+          }
+          "PATH clang-cl: $((Get-Command clang-cl).Source)"
+          clang-cl --version
+          "PATH cl: $((Get-Command cl).Source)"
+          "PATH cmake: $((Get-Command cmake).Source) $(cmake --version | Select-Object -First 1)"
+          "VCToolsVersion=$env:VCToolsVersion"
+          "LIBCLANG_PATH=$env:LIBCLANG_PATH"
+          "CC=$env:CC CXX=$env:CXX CXXFLAGS=$env:CXXFLAGS"
+
+      - name: STL header smoke (clang-cl and cl against the active MSVC STL)
+        continue-on-error: true
+        shell: pwsh
+        working-directory: tests/fixtures/windows-native-probe
+        run: |
+          $failed = 0
+          & clang-cl /nologo /std:c++17 /EHsc /c stl_smoke.cpp "/Fo$env:RUNNER_TEMP\smoke-clang.obj"
+          "clang-cl exit: $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { $failed = 1 }
+          & cl /nologo /std:c++17 /EHsc /c stl_smoke.cpp "/Fo$env:RUNNER_TEMP\smoke-cl.obj"
+          "cl exit: $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { $failed = 1 }
+          exit $failed
+
+      - name: Build the native crates like the release build
+        shell: bash
+        working-directory: tests/fixtures/windows-native-probe
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -uo pipefail
+          args=(build --release --locked)
+          [ -z "$FEATURES" ] || args+=(--features "$FEATURES")
+          log="$RUNNER_TEMP/native-build.log"
+          if cargo "${args[@]}" > "$log" 2>&1; then
+            tail -n 40 "$log"
+            ./target/release/windows-native-probe.exe || true
+          else
+            status=$?
+            echo "::group::error lines"
+            grep -n -E "error(\[|:| C[0-9]| LNK)|STL10|fatal error|FAILED:|CMake Error|panicked" "$log" | head -n 150
+            echo "::endgroup::"
+            tail -n 150 "$log"
+            exit "$status"
+          fi
