@@ -136,19 +136,21 @@ jobs:
         working-directory: tests/fixtures/windows-native-probe
         env:
           FEATURES: ${{ matrix.features }}
+          CARGO_TERM_COLOR: never
         run: |
-          set -uo pipefail
+          set +e
           args=(build --release --locked)
           [ -z "$FEATURES" ] || args+=(--features "$FEATURES")
           log="$RUNNER_TEMP/native-build.log"
-          if cargo "${args[@]}" > "$log" 2>&1; then
+          cargo "${args[@]}" > "$log" 2>&1
+          status=$?
+          if [ "$status" -eq 0 ]; then
             tail -n 40 "$log"
-            ./target/release/windows-native-probe.exe || true
-          else
-            status=$?
-            echo "::group::error lines"
-            grep -n -E "error(\[|:| C[0-9]| LNK)|STL10|fatal error|FAILED:|CMake Error|panicked" "$log" | head -n 150
-            echo "::endgroup::"
-            tail -n 150 "$log"
-            exit "$status"
+            ./target/release/windows-native-probe.exe
+            exit 0
           fi
+          echo "::group::error lines"
+          grep -n -E "error(\[|:| C[0-9]| LNK)|STL10|fatal error|FAILED:|CMake Error|panicked" "$log" | head -n 150
+          echo "::endgroup::"
+          tail -n 150 "$log"
+          exit "$status"
