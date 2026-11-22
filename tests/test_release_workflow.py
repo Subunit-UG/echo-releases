@@ -1192,7 +1192,7 @@ class MacOSRunnerContract(unittest.TestCase):
         build = self.texts["build.yml"]
         self.assertGreaterEqual(build.count("matrix.platform == 'macos-15'"), 6)
         self.assertIn("runs-on: macos-15", self.texts["promote-stable.yml"])
-        self.assertIn("xcode_app=/Applications/Xcode_16.4.app", build)
+        self.assertIn("xcode_app=/Applications/Xcode_26.3.app", build)
         self.assertIn('sudo xcode-select -s "$xcode_app/Contents/Developer"', build)
         self.assertIn('echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"', build)
 

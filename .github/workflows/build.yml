@@ -486,15 +486,17 @@ jobs:
 
       # macos-14 wurde am 02.11.2026 außer Betrieb genommen (Standard dort Xcode 15.4).
       # Xcode ist fest gepinnt statt Image-Standard: ein späterer Standardwechsel des
-      # Images (z. B. auf Xcode 26) darf Toolchain und Notarisierung nicht still ändern.
+      # Images darf Toolchain und Notarisierung nicht still ändern.
       # Fehlt die Version im Image, bricht der Build hier sichtbar ab (bewusst anheben).
+      # Xcode 26.3 bringt das macOS-26-SDK; ab diesem SDK nutzt macOS 26 die aktuelle
+      # Fenstergeometrie (Ecken, Fensterknöpfe) für die App.
       # Mindest-macOS bleibt unabhängig vom Runner: 11.0 hier und minimumSystemVersion
       # in der tauri.conf.json des Quell-Repos.
       - name: macOS build env (Xcode pin, cmake, deployment target for whisper.cpp std::filesystem)
         if: matrix.platform == 'macos-15'
         run: |
           set -euo pipefail
-          xcode_app=/Applications/Xcode_16.4.app
+          xcode_app=/Applications/Xcode_26.3.app
           [ -d "$xcode_app" ] || { echo "::error::$xcode_app fehlt im Runner-Image; Xcode-Pin bewusst anheben"; exit 1; }
           sudo xcode-select -s "$xcode_app/Contents/Developer"
           xcodebuild -version
