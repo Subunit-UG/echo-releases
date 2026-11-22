@@ -414,7 +414,20 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          choco install llvm cmake ninja --no-progress -y --installargs 'ADD_CMAKE_TO_PATH=System'
+          # The MSVC STL of the runner image accepts only a matching Clang
+          # (MSVC 14.52 / VS 18.12: Clang 22 or newer, otherwise STL1000).
+          # Clang compiles ggml's vulkan-shaders-gen host tool here, so the
+          # image's own LLVM is replaced by a pinned, hash-checked release.
+          # Same version as the Windows ARM job.
+          $llvm = "$env:RUNNER_TEMP\llvm-x64.exe"
+          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-win64.exe" -OutFile $llvm
+          $sha = (Get-FileHash -Algorithm SHA256 $llvm).Hash.ToLower()
+          if ($sha -ne "16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c") { throw "LLVM download hash mismatch: $sha" }
+          Start-Process -FilePath $llvm -ArgumentList '/S' -Wait
+          $clang = & "C:\Program Files\LLVM\bin\clang-cl.exe" --version
+          $clang
+          if (-not ($clang -match '^clang version 22\.1\.8(\s|$)')) { throw "LLVM 22.1.8 is not the active LLVM" }
+          choco install cmake ninja --no-progress -y --installargs 'ADD_CMAKE_TO_PATH=System'
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
           "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
@@ -444,12 +457,17 @@ jobs:
         if: matrix.platform == 'windows-11-arm'
         shell: pwsh
         run: |
-          # MSVC 14.51 (VS 18 im Runner-Image) lehnt Clang < 20 per STL1000 ab.
-          # 20.1.8 = dieselbe Version, mit der der x64-Job baut.
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-woa64.exe"
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm-arm64.exe"
-          Start-Process -FilePath "$env:RUNNER_TEMP\llvm-arm64.exe" -ArgumentList '/S' -Wait
-          & "C:\Program Files\LLVM\bin\clang-cl.exe" --version
+          # The MSVC STL of the runner image accepts only a matching Clang
+          # (MSVC 14.52 / VS 18.12: Clang 22 or newer, otherwise STL1000).
+          # Same pinned, hash-checked version as the Windows x64 job.
+          $llvm = "$env:RUNNER_TEMP\llvm-arm64.exe"
+          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-woa64.exe" -OutFile $llvm
+          $sha = (Get-FileHash -Algorithm SHA256 $llvm).Hash.ToLower()
+          if ($sha -ne "76f44ef1ba6eeb5a65904e9500f042f588fade49952778ce48f0374daa934396") { throw "LLVM download hash mismatch: $sha" }
+          Start-Process -FilePath $llvm -ArgumentList '/S' -Wait
+          $clang = & "C:\Program Files\LLVM\bin\clang-cl.exe" --version
+          $clang
+          if (-not ($clang -match '^clang version 22\.1\.8(\s|$)')) { throw "LLVM 22.1.8 is not the active LLVM" }
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
           "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           # CMake 4.4.4 from Kitware, pinned by hash — the x86_64 build, on
@@ -483,6 +501,18 @@ jobs:
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: arm64
+
+      # Public file only: a runner image whose MSVC STL rejects the pinned Clang
+      # fails here with a readable compiler message, before the private build.
+      - name: Windows compilers accept the runner's MSVC STL (public probe file)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: _release-ci/tests/fixtures/windows-native-probe
+        run: |
+          foreach ($compiler in 'clang-cl', 'cl') {
+            & $compiler /nologo /std:c++17 /EHsc /c stl_smoke.cpp "/Fo$env:RUNNER_TEMP\stl-smoke-$compiler.obj"
+            if ($LASTEXITCODE -ne 0) { throw "$compiler rejects the MSVC STL of this runner image" }
+          }
 
       # macos-14 wurde am 02.11.2026 außer Betrieb genommen (Standard dort Xcode 15.4).
       # Xcode ist fest gepinnt statt Image-Standard: ein späterer Standardwechsel des
