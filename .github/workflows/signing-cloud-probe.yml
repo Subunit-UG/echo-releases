@@ -2,8 +2,8 @@ name: Signing cloud probe (Artifact Signing)
 
 # Manual end-to-end check of Windows cloud signing before release builds use it:
 # OIDC login, certificate profile access, Authenticode signature, publisher
-# subject and RFC 3161 timestamp. Only a disposable copy of a system EXE is
-# signed; no release file is built, signed or uploaded.
+# subject and RFC 3161 timestamp. Only a disposable, unsigned copy of a system
+# EXE is signed; no release file is built, signed or uploaded.
 on:
   workflow_dispatch:
 
@@ -99,6 +99,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $dummy = Join-Path $env:RUNNER_TEMP 'probe.exe'
           Copy-Item (Join-Path $env:WINDIR 'System32/where.exe') $dummy
+          # System EXEs carry Microsoft's embedded signature; start from an unsigned file
+          # so the check below can only see the signature this probe creates.
+          & $env:SIGNTOOL_PATH remove /s $dummy
+          if ($LASTEXITCODE -ne 0) { throw 'Could not remove the existing signature' }
+          if ((Get-AuthenticodeSignature -LiteralPath $dummy).Status -ne 'NotSigned') { throw 'Probe input is still signed' }
           $before = (Get-FileHash $dummy -Algorithm SHA256).Hash
           # The script throws unless signature, exact publisher and timestamp verify.
           try {

@@ -1462,6 +1462,9 @@ class CloudSigningProbeContract(unittest.TestCase):
             self.assertIn(pin, WORKFLOW)
             self.assertIn(pin, CLOUD_PROBE_WORKFLOW)
         self.assertIn('& "$env:GITHUB_WORKSPACE/scripts/sign-windows.ps1" $dummy', CLOUD_PROBE_WORKFLOW)
+        # A pre-signed input would let the publisher check see a foreign signer.
+        self.assertLess(CLOUD_PROBE_WORKFLOW.index("remove /s $dummy"), CLOUD_PROBE_WORKFLOW.index("sign-windows.ps1\" $dummy"))
+        self.assertIn("Status -ne 'NotSigned'", CLOUD_PROBE_WORKFLOW)
 
     def test_probe_contract_rejects_each_scope_mutation(self) -> None:
         mutants = {
