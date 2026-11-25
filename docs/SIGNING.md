@@ -153,7 +153,8 @@ vollständiges Plattform-Bundling und Apple-Notarisierung sind **nicht verifizie
 `main`, in der Umgebung `release-signing` mit job-weitem `id-token: write`. Er
 meldet sich per OIDC an, lädt dieselben gepinnten Werkzeuge wie der Build und
 signiert mit `scripts/sign-windows.ps1` eine Wegwerf-Kopie einer System-EXE
-(vorher per `signtool remove /s` von der Microsoft-Signatur befreit) auf
+(vorher per geändertem PE-Zeitstempel vom Windows-Katalog gelöst und als
+unsigniert geprüft) auf
 x64 und ARM64. Erfolg heißt: gültige Authenticode-Signatur, exakter Subject aus
 `WINDOWS_PUBLISHER`, Zeitstempel vorhanden. Es wird keine Release-Datei gebaut,
 signiert oder hochgeladen. Erst nach einem grünen Lauf wird
