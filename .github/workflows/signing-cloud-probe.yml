@@ -1,0 +1,113 @@
+name: Signing cloud probe (Artifact Signing)
+
+# Manual end-to-end check of Windows cloud signing before release builds use it:
+# OIDC login, certificate profile access, Authenticode signature, publisher
+# subject and RFC 3161 timestamp. Only a disposable copy of a system EXE is
+# signed; no release file is built, signed or uploaded.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cloud-signing:
+    name: Cloud signing / ${{ matrix.runner }}
+    # The release-signing environment only admits main; the condition keeps
+    # dispatches from other refs from requesting it at all.
+    if: github.ref == 'refs/heads/main'
+    environment: release-signing
+    permissions:
+      contents: read
+      id-token: write # Federated credential is bound to this environment.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      WINDOWS_SIGNING_BACKEND: artifact-signing
+      WINDOWS_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, immutable
+        with:
+          persist-credentials: false
+
+      - name: Azure OIDC login
+        uses: azure/login@8216e11d8cd9b42fe925c852af8e76311ff067ac # v2, immutable
+        env:
+          AZURE_CORE_OUTPUT: none
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prepare signing tools (same pins as the release build)
+        env:
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_CERTIFICATE_PROFILE: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in 'WINDOWS_PUBLISHER', 'ARTIFACT_SIGNING_ENDPOINT', 'ARTIFACT_SIGNING_ACCOUNT', 'ARTIFACT_SIGNING_CERTIFICATE_PROFILE') {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "$name is required" }
+          }
+          $signing = Join-Path $env:RUNNER_TEMP 'windows-signing'
+          New-Item -ItemType Directory -Path $signing | Out-Null
+          # Keep the complete package: the native dlib needs its adjacent assemblies.
+          $package = Join-Path $signing 'client.zip'
+          Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.artifactsigning.client/1.0.146/microsoft.artifactsigning.client.1.0.146.nupkg' -OutFile $package
+          if ((Get-FileHash $package -Algorithm SHA256).Hash.ToLowerInvariant() -ne '7761e5d8f31e54b764da21d33cd8b0a2940e1b05526c7dfcb5e94b0431426f70') { throw 'Artifact Signing client checksum mismatch' }
+          Expand-Archive $package -DestinationPath (Join-Path $signing 'client')
+          $dlib = Join-Path $signing 'client/bin/x64/Azure.CodeSigning.Dlib.dll'
+          if (-not (Test-Path -LiteralPath $dlib)) { throw 'x64 Artifact Signing dlib missing' }
+          $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+          $signtool = Get-ChildItem $kits -Filter signtool.exe -File -Recurse |
+            Where-Object { $_.Directory.Name -eq 'x64' -and [version]$_.Directory.Parent.Name -ge [version]'10.0.22621.755' } |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'Compatible x64 SignTool missing' }
+          # An x64 runtime is needed even when PowerShell and the runner are ARM64.
+          $runtime = Join-Path $signing 'dotnet.zip'
+          Invoke-WebRequest 'https://builds.dotnet.microsoft.com/dotnet/Runtime/8.0.32/dotnet-runtime-8.0.32-win-x64.zip' -OutFile $runtime
+          if ((Get-FileHash $runtime -Algorithm SHA512).Hash.ToLowerInvariant() -ne 'f0349e793d8081c682c01d736db695c9c1ec268c6173648913543db219e44cbf2e952c7ef94fc37946b0f2bb95ca1898d972a43591b8e44d5a1659f4911904c0') { throw '.NET runtime checksum mismatch' }
+          $dotnet = Join-Path $signing 'dotnet-x64'
+          Expand-Archive $runtime -DestinationPath $dotnet
+          "DOTNET_ROOT=$dotnet" >> $env:GITHUB_ENV
+          "DOTNET_ROOT_X64=$dotnet" >> $env:GITHUB_ENV
+          "SIGNTOOL_PATH=$($signtool.FullName)" >> $env:GITHUB_ENV
+          "ARTIFACT_SIGNING_DLIB_PATH=$dlib" >> $env:GITHUB_ENV
+          # Only AzureCliCredential may use the preceding azure/login OIDC session.
+          $configPath = Join-Path $signing 'metadata.json'
+          @{
+            Endpoint = $env:ARTIFACT_SIGNING_ENDPOINT
+            CodeSigningAccountName = $env:ARTIFACT_SIGNING_ACCOUNT
+            CertificateProfileName = $env:ARTIFACT_SIGNING_CERTIFICATE_PROFILE
+            ExcludeCredentials = @(
+              'EnvironmentCredential', 'WorkloadIdentityCredential', 'ManagedIdentityCredential',
+              'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential',
+              'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential'
+            )
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM $configPath
+          "WINDOWS_SIGNING_CONFIG=$configPath" >> $env:GITHUB_ENV
+
+      - name: Sign a disposable EXE with the release signing script
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dummy = Join-Path $env:RUNNER_TEMP 'probe.exe'
+          Copy-Item (Join-Path $env:WINDIR 'System32/where.exe') $dummy
+          $before = (Get-FileHash $dummy -Algorithm SHA256).Hash
+          # The script throws unless signature, exact publisher and timestamp verify.
+          & "$env:GITHUB_WORKSPACE/scripts/sign-windows.ps1" $dummy
+          if ((Get-FileHash $dummy -Algorithm SHA256).Hash -eq $before) { throw 'Signing left the EXE unchanged' }
+          $signature = Get-AuthenticodeSignature -LiteralPath $dummy
+          $line = "PROBE cloud signing PASS $env:RUNNER_ARCH status=$($signature.Status) timestamped=$([bool]$signature.TimeStamperCertificate) publisher=exact"
+          Write-Output $line
+          $line >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Azure logout
+        if: always()
+        run: az logout
