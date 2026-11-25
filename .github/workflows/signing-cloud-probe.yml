@@ -101,7 +101,16 @@ jobs:
           Copy-Item (Join-Path $env:WINDIR 'System32/where.exe') $dummy
           $before = (Get-FileHash $dummy -Algorithm SHA256).Hash
           # The script throws unless signature, exact publisher and timestamp verify.
-          & "$env:GITHUB_WORKSPACE/scripts/sign-windows.ps1" $dummy
+          try {
+            & "$env:GITHUB_WORKSPACE/scripts/sign-windows.ps1" $dummy
+          } finally {
+            # Public certificate facts only, so a failed check names its cause.
+            $found = Get-AuthenticodeSignature -LiteralPath $dummy
+            Write-Output "PROBE status=$($found.Status) message=$($found.StatusMessage)"
+            Write-Output "PROBE subject=[$($found.SignerCertificate.Subject)]"
+            Write-Output "PROBE expected=[$env:WINDOWS_PUBLISHER]"
+            Write-Output "PROBE subjectMatches=$($found.SignerCertificate.Subject -ceq $env:WINDOWS_PUBLISHER) timestamper=[$($found.TimeStamperCertificate.Subject)]"
+          }
           if ((Get-FileHash $dummy -Algorithm SHA256).Hash -eq $before) { throw 'Signing left the EXE unchanged' }
           $signature = Get-AuthenticodeSignature -LiteralPath $dummy
           $line = "PROBE cloud signing PASS $env:RUNNER_ARCH status=$($signature.Status) timestamped=$([bool]$signature.TimeStamperCertificate) publisher=exact"
