@@ -22,6 +22,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
 CONTRACT_WORKFLOW = (ROOT / ".github/workflows/release-contract.yml").read_text(encoding="utf-8")
 PR_CHECK_WORKFLOW = (ROOT / ".github/workflows/pr-check.yml").read_text(encoding="utf-8")
+CLOUD_PROBE_WORKFLOW = (ROOT / ".github/workflows/signing-cloud-probe.yml").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 PLATFORM_TRUST_DOC = (ROOT / "docs/PLATFORM-TRUST.md").read_text(encoding="utf-8")
 SIGNING_DOC = (ROOT / "docs/SIGNING.md").read_text(encoding="utf-8")
@@ -261,6 +262,8 @@ class ReleaseWorkflowContract(unittest.TestCase):
             "scripts/validate-macos-app-archive.py",
             "scripts/verify-platform-macos.sh",
             "scripts/verify-platform-windows.ps1",
+            "scripts/sign-windows.ps1",
+            ".github/workflows/signing-cloud-probe.yml",
             "tests/test_release_workflow.py",
             "docs/PLATFORM-TRUST.md",
         ):
@@ -1413,6 +1416,67 @@ class WindowsToolchainContract(unittest.TestCase):
             self.assertIn(f'{crate} = "={version}"', manifest)
             self.assertIn(f'name = "{crate}"\nversion = "{version}"', lock)
         self.assertIn('gpu = ["whisper-rs/vulkan"]', manifest)
+
+
+def cloud_probe_errors(workflow: str) -> list[str]:
+    """The cloud probe may sign only through the main-bound release environment."""
+    errors: list[str] = []
+    header, jobs = workflow.split("\njobs:\n", 1)
+    if not re.search(r"(?m)^on:\n  workflow_dispatch:\n\n", header):
+        errors.append("probe must be manual only")
+    if re.search(r"(?i)azure|id-token|secrets\.", header):
+        errors.append("Azure/OIDC access is forbidden at workflow level")
+    if re.search(r"\npermissions:\n  contents: read\n*\Z", header) is None:
+        errors.append("workflow permissions must be read-only")
+    names = re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\n", jobs)
+    if names != ["cloud-signing"]:
+        errors.append(f"unexpected jobs: {names}")
+    job = job_block(workflow, "cloud-signing")
+    for required in (
+        "    if: github.ref == 'refs/heads/main'\n",
+        "    environment: release-signing\n",
+        "    permissions:\n      contents: read\n      id-token: write",
+        "      WINDOWS_SIGNING_BACKEND: artifact-signing\n",
+        "      - name: Azure logout\n        if: always()\n",
+    ):
+        if required not in job:
+            errors.append(f"missing: {required.strip()}")
+    if re.search(r"contents: write|github\.event\.|upload-artifact|gh release", job):
+        errors.append("probe must not write, upload or read event text")
+    return errors
+
+
+class CloudSigningProbeContract(unittest.TestCase):
+    def test_probe_is_manual_main_bound_and_read_only(self) -> None:
+        self.assertEqual(cloud_probe_errors(CLOUD_PROBE_WORKFLOW), [])
+
+    def test_probe_uses_release_pins_and_release_signing_script(self) -> None:
+        for pin in (
+            re.search(r"uses: azure/login@[0-9a-f]{40}", WORKFLOW).group(0),
+            "microsoft.artifactsigning.client.1.0.146.nupkg",
+            "7761e5d8f31e54b764da21d33cd8b0a2940e1b05526c7dfcb5e94b0431426f70",
+            "dotnet-runtime-8.0.32-win-x64.zip",
+            "f0349e793d8081c682c01d736db695c9c1ec268c6173648913543db219e44cbf2e952c7ef94fc37946b0f2bb95ca1898d972a43591b8e44d5a1659f4911904c0",
+            "'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential'",
+        ):
+            self.assertIn(pin, WORKFLOW)
+            self.assertIn(pin, CLOUD_PROBE_WORKFLOW)
+        self.assertIn('& "$env:GITHUB_WORKSPACE/scripts/sign-windows.ps1" $dummy', CLOUD_PROBE_WORKFLOW)
+
+    def test_probe_contract_rejects_each_scope_mutation(self) -> None:
+        mutants = {
+            "push trigger": CLOUD_PROBE_WORKFLOW.replace("  workflow_dispatch:\n", "  workflow_dispatch:\n  push:\n", 1),
+            "workflow OIDC": CLOUD_PROBE_WORKFLOW.replace("permissions:\n  contents: read\n", "permissions:\n  contents: read\n  id-token: write\n", 1),
+            "any ref": CLOUD_PROBE_WORKFLOW.replace("    if: github.ref == 'refs/heads/main'\n", "", 1),
+            "no environment": CLOUD_PROBE_WORKFLOW.replace("    environment: release-signing\n", "", 1),
+            "write access": CLOUD_PROBE_WORKFLOW.replace("      contents: read\n      id-token", "      contents: write\n      id-token", 1),
+            "second job": CLOUD_PROBE_WORKFLOW + "\n  extra:\n    runs-on: ubuntu-latest\n",
+            "no logout": CLOUD_PROBE_WORKFLOW.replace("        if: always()\n        run: az logout", "        run: az logout", 1),
+        }
+        for label, mutant in mutants.items():
+            with self.subTest(mutation=label):
+                self.assertNotEqual(mutant, CLOUD_PROBE_WORKFLOW)
+                self.assertTrue(cloud_probe_errors(mutant))
 
 
 if __name__ == "__main__":

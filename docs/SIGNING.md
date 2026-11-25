@@ -147,6 +147,17 @@ auf null. Echte Signierfehler bleiben im Produktionsskript unverändert fatal.
 Tatsächliche OIDC-Anmeldung, Zertifikatszugriff, Signierung, Zeitstempel,
 vollständiges Plattform-Bundling und Apple-Notarisierung sind **nicht verifiziert**.
 
+### Echte Cloud-Signatur prüfen
+
+`signing-cloud-probe.yml` läuft nur manuell per `workflow_dispatch` und nur auf
+`main`, in der Umgebung `release-signing` mit job-weitem `id-token: write`. Er
+meldet sich per OIDC an, lädt dieselben gepinnten Werkzeuge wie der Build und
+signiert mit `scripts/sign-windows.ps1` eine Wegwerf-Kopie einer System-EXE auf
+x64 und ARM64. Erfolg heißt: gültige Authenticode-Signatur, exakter Subject aus
+`WINDOWS_PUBLISHER`, Zeitstempel vorhanden. Es wird keine Release-Datei gebaut,
+signiert oder hochgeladen. Erst nach einem grünen Lauf wird
+`WINDOWS_SIGNING_BACKEND` gesetzt.
+
 ### Plan B, falls ARM-Werkzeuge nicht starten
 
 In einem gesonderten Umbau: auf ARM64 nur kompilieren und die benötigten
