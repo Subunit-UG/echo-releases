@@ -99,10 +99,15 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $dummy = Join-Path $env:RUNNER_TEMP 'probe.exe'
           Copy-Item (Join-Path $env:WINDIR 'System32/where.exe') $dummy
-          # System EXEs carry Microsoft's embedded signature; start from an unsigned file
+          # System EXEs are trusted through a Windows catalog that matches their
+          # Authenticode hash, which excludes embedded signatures. Changing the COFF
+          # TimeDateStamp leaves the program intact but detaches it from any catalog,
           # so the check below can only see the signature this probe creates.
-          & $env:SIGNTOOL_PATH remove /s $dummy
-          if ($LASTEXITCODE -ne 0) { throw 'Could not remove the existing signature' }
+          $bytes = [IO.File]::ReadAllBytes($dummy)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x00004550) { throw 'Probe input is not a PE file' }
+          [BitConverter]::GetBytes([uint32][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()).CopyTo($bytes, $pe + 8)
+          [IO.File]::WriteAllBytes($dummy, $bytes)
           if ((Get-AuthenticodeSignature -LiteralPath $dummy).Status -ne 'NotSigned') { throw 'Probe input is still signed' }
           $before = (Get-FileHash $dummy -Algorithm SHA256).Hash
           # The script throws unless signature, exact publisher and timestamp verify.
