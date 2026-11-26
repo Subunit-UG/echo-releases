@@ -1465,6 +1465,13 @@ class WindowsShippedSignatureContract(unittest.TestCase):
         script = (ROOT / "scripts" / "sign-windows.ps1").read_text(encoding="utf-8")
         self.assertIn("SIGNFACT name=$name exit=$Exit status=$($found.Status) subjectMatches=$subjectMatches timestamped=", script)
         self.assertLess(script.index('Write-SigningFact "$exitCode"'), script.index("throw 'Windows signing command failed'"))
+        # Transient service or timestamp failures are retried, but a file that
+        # never signed still fails, and retries never weaken the final check.
+        self.assertIn("$maxAttempts = 3", script)
+        self.assertIn("if ($exitCode -ne 0) { throw 'Windows signing command failed' }", script)
+        self.assertLess(script.index("throw 'Windows signing command failed'"), script.index("Get-AuthenticodeSignature -LiteralPath $ArtifactPath\nif ("))
+        self.assertIn("Where-Object { $_ -notmatch '^SIGNFAIL ' }", step)
+        self.assertNotRegex(script, r"\$error\b")
 
 
 class CloudSigningProbeContract(unittest.TestCase):
