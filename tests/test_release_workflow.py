@@ -1472,6 +1472,11 @@ class WindowsShippedSignatureContract(unittest.TestCase):
         self.assertLess(script.index("throw 'Windows signing command failed'"), script.index("Get-AuthenticodeSignature -LiteralPath $ArtifactPath\nif ("))
         self.assertIn("Where-Object { $_ -notmatch '^SIGNFAIL ' }", step)
         self.assertNotRegex(script, r"\$error\b")
+        # Public facts never carry free text from tool output.
+        self.assertIn('"SIGNFAIL name=$name attempt=$Attempt exit=$Exit reason=$reason hresult=$hresult"', script)
+        self.assertNotIn("error=$", script)
+        for code in ("'timestamp'", "'auth'", "'throttled'", "'service'", "'unknown'"):
+            self.assertIn(code, script)
 
 
 class CloudSigningProbeContract(unittest.TestCase):

@@ -12,9 +12,16 @@ function Write-SigningFact([string] $Exit, [int] $Attempt, [string] $Detail) {
     $subjectMatches = [bool]($found.SignerCertificate -and $found.SignerCertificate.Subject -ceq $env:WINDOWS_PUBLISHER)
     $line = "SIGNFACT name=$name exit=$Exit status=$($found.Status) subjectMatches=$subjectMatches timestamped=$([bool]$found.TimeStamperCertificate)"
     if ($Exit -ne '0') {
-      $reason = ($Detail -replace '[^A-Za-z0-9._ -]', '_').Trim()
-      if ($reason.Length -gt 160) { $reason = $reason.Substring(0, 160) }
-      $line = "SIGNFAIL name=$name attempt=$Attempt exit=$Exit error=$reason"
+      # Fixed reason codes only; raw tool output stays in the confidential step.
+      $reason = switch -Regex ($Detail) {
+        '(?i)timestamp' { 'timestamp'; break }
+        '(?i)401|403|unauthori|forbidden|credential|authenticat' { 'auth'; break }
+        '(?i)429|throttl|too many' { 'throttled'; break }
+        '(?i)50[0-9]|unavailable|timed? ?out|connection' { 'service'; break }
+        default { 'unknown' }
+      }
+      $hresult = if ($Detail -match '0x[0-9A-Fa-f]{8}') { $Matches[0].ToLowerInvariant() } else { 'none' }
+      $line = "SIGNFAIL name=$name attempt=$Attempt exit=$Exit reason=$reason hresult=$hresult"
     }
     $line | Add-Content -Encoding utf8NoBOM (Join-Path $env:RUNNER_TEMP 'windows-signing-facts.txt')
   } catch {
@@ -39,7 +46,7 @@ for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
   }
   $exitCode = $LASTEXITCODE
   $output | ForEach-Object { Write-Host $_ }
-  $detail = ($output | Where-Object { "$_" -match 'SignTool Error|error' } | Select-Object -First 1) -as [string]
+  $detail = ($output | ForEach-Object { "$_" }) -join "`n"
   if ($exitCode -eq 0) {
     Write-SigningFact '0' $attempt ''
     break
