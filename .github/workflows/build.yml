@@ -805,7 +805,7 @@ jobs:
         run: |
           $facts = Join-Path $env:RUNNER_TEMP 'windows-signing-facts.txt'
           if (Test-Path -LiteralPath $facts) {
-            Get-Content -LiteralPath $facts | Where-Object { $_ -match '^SIGNFACT [A-Za-z0-9=._ -]+$' }
+            Get-Content -LiteralPath $facts | Where-Object { $_ -match '^SIGN(FACT|FAIL) [A-Za-z0-9=._ -]+$' }
           } else {
             'SIGNFACT none: the signing command was never invoked'
           }
@@ -835,7 +835,9 @@ jobs:
           # signing time, the shipped installers by their bytes on disk.
           $factsPath = Join-Path $env:RUNNER_TEMP 'windows-signing-facts.txt'
           if (-not (Test-Path -LiteralPath $factsPath)) { throw 'No signing facts: nothing was signed' }
-          $facts = @(Get-Content -LiteralPath $factsPath)
+          # SIGNFAIL lines record retried attempts; the final outcome of every file
+          # is its SIGNFACT line, and those must all be fully valid.
+          $facts = @(Get-Content -LiteralPath $factsPath | Where-Object { $_ -notmatch '^SIGNFAIL ' })
           $valid = '^SIGNFACT name=(?<name>[A-Za-z0-9._-]+) exit=0 status=Valid subjectMatches=True timestamped=True$'
           foreach ($line in $facts) {
             if ($line -notmatch $valid) { throw "Signing fact is not fully valid: $line" }
