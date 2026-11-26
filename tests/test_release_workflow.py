@@ -1422,7 +1422,8 @@ def cloud_probe_errors(workflow: str) -> list[str]:
     """The cloud probe may sign only through the main-bound release environment."""
     errors: list[str] = []
     header, jobs = workflow.split("\njobs:\n", 1)
-    if not re.search(r"(?m)^on:\n  workflow_dispatch:\n\n", header):
+    # Only workflow_dispatch, optionally with indented inputs, before the next block.
+    if not re.search(r"(?m)^on:\n  workflow_dispatch:\n(?:    [^\n]*\n)*\n", header):
         errors.append("probe must be manual only")
     if re.search(r"(?i)azure|id-token|secrets\.", header):
         errors.append("Azure/OIDC access is forbidden at workflow level")

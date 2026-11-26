@@ -6,6 +6,13 @@ name: Signing cloud probe (Artifact Signing)
 # EXE is signed; no release file is built, signed or uploaded.
 on:
   workflow_dispatch:
+    inputs:
+      repeat:
+        description: "Signing rounds per runner for the release application sample"
+        required: true
+        default: "1"
+        type: choice
+        options: ["1", "3", "5", "10"]
 
 permissions:
   contents: read
@@ -25,7 +32,7 @@ jobs:
       matrix:
         runner: [windows-latest, windows-11-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 90
     defaults:
       run:
         shell: pwsh
@@ -126,6 +133,51 @@ jobs:
           $line = "PROBE cloud signing PASS $env:RUNNER_ARCH status=$($signature.Status) timestamped=$([bool]$signature.TimeStamperCertificate) publisher=exact"
           Write-Output $line
           $line >> $env:GITHUB_STEP_SUMMARY
+
+      # Re-signs the application from the current public Echo installer for this
+      # architecture, several rounds in a row, to measure intermittent failures
+      # on the real binary. Nothing is uploaded; the copies stay in RUNNER_TEMP.
+      - name: Sign the released application repeatedly
+        env:
+          ROUNDS: ${{ inputs.repeat }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:ROUNDS -notmatch '^(1|3|5|10)$') { throw 'Unsupported round count' }
+          $sevenZip = Join-Path $env:ProgramFiles '7-Zip/7z.exe'
+          if (-not (Test-Path -LiteralPath $sevenZip)) { throw '7-Zip is not available on this runner' }
+          $work = Join-Path $env:RUNNER_TEMP 'release-sample'
+          New-Item -ItemType Directory -Path $work | Out-Null
+          $manifest = Invoke-RestMethod 'https://github.com/Subunit-UG/echo-releases/releases/latest/download/latest.json'
+          $platform = if ($env:RUNNER_ARCH -eq 'ARM64') { 'windows-aarch64' } else { 'windows-x86_64' }
+          $url = [string]$manifest.platforms.$platform.url
+          if ($url -notmatch '^https://github\.com/Subunit-UG/echo-releases/releases/download/v[0-9.]+/echo_[0-9.]+_(x64|arm64)-setup\.exe$') { throw 'Unexpected installer URL' }
+          $installer = Join-Path $work 'setup.exe'
+          Invoke-WebRequest $url -OutFile $installer
+          & $sevenZip e -y "-o$work" $installer 'echo.exe' | Out-Null
+          $original = Join-Path $work 'echo.exe'
+          if (-not (Test-Path -LiteralPath $original)) { throw 'Application not found in installer' }
+          $sizeMb = [math]::Round((Get-Item -LiteralPath $original).Length / 1MB)
+          $passed = 0
+          for ($round = 1; $round -le [int]$env:ROUNDS; $round++) {
+            $copy = Join-Path $work "round-$round.exe"
+            Copy-Item -LiteralPath $original -Destination $copy
+            & $env:SIGNTOOL_PATH remove /s $copy | Out-Null
+            if ($LASTEXITCODE -ne 0 -or (Get-AuthenticodeSignature -LiteralPath $copy).Status -ne 'NotSigned') { throw 'Could not start from an unsigned copy' }
+            try {
+              & "$env:GITHUB_WORKSPACE/scripts/sign-windows.ps1" $copy
+              $passed++
+            } catch {
+              Write-Output "PROBE round $round failed after all attempts"
+            }
+          }
+          $facts = Join-Path $env:RUNNER_TEMP 'windows-signing-facts.txt'
+          if (Test-Path -LiteralPath $facts) {
+            Get-Content -LiteralPath $facts | Where-Object { $_ -match '^SIGN(FACT|FAIL) name=round-[A-Za-z0-9=._ -]+$' }
+          }
+          $line = "PROBE release sample $env:RUNNER_ARCH sizeMb=$sizeMb rounds=$env:ROUNDS passed=$passed"
+          Write-Output $line
+          $line >> $env:GITHUB_STEP_SUMMARY
+          if ($passed -ne [int]$env:ROUNDS) { throw 'At least one round failed after all attempts' }
 
       - name: Azure logout
         if: always()
