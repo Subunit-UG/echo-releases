@@ -1467,15 +1467,15 @@ class WindowsShippedSignatureContract(unittest.TestCase):
         self.assertLess(script.index('Write-SigningFact "$exitCode"'), script.index("throw 'Windows signing command failed'"))
         # Transient service or timestamp failures are retried, but a file that
         # never signed still fails, and retries never weaken the final check.
-        self.assertIn("$maxAttempts = 3", script)
+        self.assertIn("$maxAttempts = 4", script)
         self.assertIn("if ($exitCode -ne 0) { throw 'Windows signing command failed' }", script)
         self.assertLess(script.index("throw 'Windows signing command failed'"), script.index("Get-AuthenticodeSignature -LiteralPath $ArtifactPath\nif ("))
         self.assertIn("Where-Object { $_ -notmatch '^SIGNFAIL ' }", step)
         self.assertNotRegex(script, r"\$error\b")
         # Public facts never carry free text from tool output.
-        self.assertIn('"SIGNFAIL name=$name attempt=$Attempt exit=$Exit reason=$reason hresult=$hresult"', script)
+        self.assertIn('"SIGNFAIL name=$name attempt=$Attempt exit=$Exit stage=$stage reason=$reason hresult=$hresult sizeMb=$sizeMb"', script)
         self.assertNotIn("error=$", script)
-        for code in ("'timestamp'", "'auth'", "'throttled'", "'service'", "'unknown'"):
+        for code in ("'timestamp'", "'sign'", "'auth'", "'throttled'", "'service'", "'size'", "'unknown'"):
             self.assertIn(code, script)
 
 

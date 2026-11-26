@@ -12,16 +12,24 @@ function Write-SigningFact([string] $Exit, [int] $Attempt, [string] $Detail) {
     $subjectMatches = [bool]($found.SignerCertificate -and $found.SignerCertificate.Subject -ceq $env:WINDOWS_PUBLISHER)
     $line = "SIGNFACT name=$name exit=$Exit status=$($found.Status) subjectMatches=$subjectMatches timestamped=$([bool]$found.TimeStamperCertificate)"
     if ($Exit -ne '0') {
-      # Fixed reason codes only; raw tool output stays in the confidential step.
-      $reason = switch -Regex ($Detail) {
-        '(?i)timestamp' { 'timestamp'; break }
-        '(?i)401|403|unauthori|forbidden|credential|authenticat' { 'auth'; break }
-        '(?i)429|throttl|too many' { 'throttled'; break }
-        '(?i)50[0-9]|unavailable|timed? ?out|connection' { 'service'; break }
+      # Fixed codes only, derived from error lines (verbose output names the
+      # timestamp server on every run); raw tool output stays confidential.
+      $errors = (($Detail -split "`n") | Where-Object { $_ -match '(?i)SignTool Error|Error information|exception|status code|failed' }) -join "`n"
+      $stage = switch -Regex ($errors) {
+        'SignerTimeStamp' { 'timestamp'; break }
+        'SignerSign' { 'sign'; break }
         default { 'unknown' }
       }
-      $hresult = if ($Detail -match '0x[0-9A-Fa-f]{8}') { $Matches[0].ToLowerInvariant() } else { 'none' }
-      $line = "SIGNFAIL name=$name attempt=$Attempt exit=$Exit reason=$reason hresult=$hresult"
+      $reason = switch -Regex ($errors) {
+        '(?i)\b40[13]\b|unauthori|forbidden|credential|authenticat' { 'auth'; break }
+        '(?i)\b429\b|throttl|too many' { 'throttled'; break }
+        '(?i)\b50[0-9]\b|unavailable|timed? ?out|connection|socket' { 'service'; break }
+        '(?i)size|too large|length' { 'size'; break }
+        default { 'unknown' }
+      }
+      $hresult = if ($errors -match '0x[0-9A-Fa-f]{8}') { $Matches[0].ToLowerInvariant() } else { 'none' }
+      $sizeMb = [math]::Round((Get-Item -LiteralPath $ArtifactPath).Length / 1MB)
+      $line = "SIGNFAIL name=$name attempt=$Attempt exit=$Exit stage=$stage reason=$reason hresult=$hresult sizeMb=$sizeMb"
     }
     $line | Add-Content -Encoding utf8NoBOM (Join-Path $env:RUNNER_TEMP 'windows-signing-facts.txt')
   } catch {
@@ -32,7 +40,7 @@ function Write-SigningFact([string] $Exit, [int] $Attempt, [string] $Detail) {
 # The signing service and the RFC 3161 timestamp server can fail transiently;
 # Microsoft recommends retrying. Every attempt starts from the unsigned input
 # because signtool only writes the file after a complete, timestamped signature.
-$maxAttempts = 3
+$maxAttempts = 4
 for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
   $PSNativeCommandUseErrorActionPreference = $false
   switch -CaseSensitive ($env:WINDOWS_SIGNING_BACKEND) {
@@ -52,7 +60,7 @@ for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
     break
   }
   Write-SigningFact "$exitCode" $attempt $detail
-  if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds (15 * $attempt) }
+  if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds (30 * [math]::Pow(2, $attempt - 1)) }
 }
 if ($exitCode -ne 0) { throw 'Windows signing command failed' }
 # Verify each file before Tauri can place it inside an installer or upload it.
