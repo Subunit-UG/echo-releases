@@ -1446,6 +1446,27 @@ def cloud_probe_errors(workflow: str) -> list[str]:
     return errors
 
 
+class WindowsShippedSignatureContract(unittest.TestCase):
+    """The post-build check proves what ships, never Tauri's unsigned intermediate."""
+
+    def step(self) -> str:
+        start = WORKFLOW.index("      - name: Verify enabled Windows signing before release gates\n")
+        end = WORKFLOW.index("\n      - ", start + 1)
+        return WORKFLOW[start:end]
+
+    def test_check_uses_signing_facts_and_shipped_installers(self) -> None:
+        step = self.step()
+        self.assertNotIn("Get-ChildItem $root -Filter '*.exe'", step)
+        self.assertIn("'No signing facts: nothing was signed'", step)
+        self.assertIn("exit=0 status=Valid subjectMatches=True timestamped=True$'", step)
+        self.assertIn("'Application executable was never signed'", step)
+        self.assertIn("Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe'", step)
+        self.assertIn("$signature.SignerCertificate.Subject -cne $env:WINDOWS_PUBLISHER", step)
+        script = (ROOT / "scripts" / "sign-windows.ps1").read_text(encoding="utf-8")
+        self.assertIn("SIGNFACT name=$name exit=$Exit status=$($found.Status) subjectMatches=$subjectMatches timestamped=", script)
+        self.assertLess(script.index('Write-SigningFact "$exitCode"'), script.index("throw 'Windows signing command failed'"))
+
+
 class CloudSigningProbeContract(unittest.TestCase):
     def test_probe_is_manual_main_bound_and_read_only(self) -> None:
         self.assertEqual(cloud_probe_errors(CLOUD_PROBE_WORKFLOW), [])

@@ -20,7 +20,11 @@ App-Konfiguration bleibt unverändert. `signCommand` verwendet ein Argument-Arra
 damit Pfade mit Leerzeichen intakt bleiben. Nach jeder Signatur muss
 `Get-AuthenticodeSignature` einen gültigen Signer, den **exakten vollständigen
 Subject** aus `WINDOWS_PUBLISHER` und einen Zeitstempel melden. Eine weitere
-Prüfung erfasst Anwendung und NSIS-Installer nach dem Build. Jeder Fehler stoppt
+Prüfung nach dem Build verlangt, dass jede beim Signieren festgehaltene Datei
+gültig ist, dass die Anwendung darunter ist und dass jeder NSIS-Installer auf
+der Platte gültig signiert ist. `src-tauri/target/release/*.exe` bleibt dabei
+außen vor: Tauri signiert eine gepatchte Kopie der Anwendung und packt diese in
+den Installer, die Datei im Zielordner ist eine unsignierte Zwischenstufe. Jeder Fehler stoppt
 den Build und damit die nachfolgenden Veröffentlichungsgates.
 
 Für Artifact Signing ruft das eingecheckte `scripts/sign-windows.ps1` SignTool
