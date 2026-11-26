@@ -828,13 +828,27 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $root = 'src-tauri/target/release'
-          $files = @(
-            Get-ChildItem $root -Filter '*.exe' -File
-            Get-ChildItem "$root/bundle/nsis" -Filter '*.exe' -File
-          ) | Sort-Object FullName -Unique
-          if ($files.Count -lt 2) { throw 'Application and NSIS installer must both exist' }
           if ([string]::IsNullOrWhiteSpace($env:WINDOWS_PUBLISHER)) { throw 'WINDOWS_PUBLISHER is required' }
+          # src-tauri/target/release/*.exe is Tauri's unsigned intermediate; Tauri signs
+          # a patched copy of the application and packs that into the installer. The
+          # application is therefore proven by the facts sign-windows.ps1 recorded at
+          # signing time, the shipped installers by their bytes on disk.
+          $factsPath = Join-Path $env:RUNNER_TEMP 'windows-signing-facts.txt'
+          if (-not (Test-Path -LiteralPath $factsPath)) { throw 'No signing facts: nothing was signed' }
+          $facts = @(Get-Content -LiteralPath $factsPath)
+          $valid = '^SIGNFACT name=(?<name>[A-Za-z0-9._-]+) exit=0 status=Valid subjectMatches=True timestamped=True$'
+          foreach ($line in $facts) {
+            if ($line -notmatch $valid) { throw "Signing fact is not fully valid: $line" }
+          }
+          $signedNames = @($facts | ForEach-Object { if ($_ -match $valid) { $Matches.name } })
+          if (-not ($signedNames | Where-Object { $_ -like '*.exe' -and $_ -notlike '*-setup.exe' })) {
+            throw 'Application executable was never signed'
+          }
+          $files = @(Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe' -File)
+          if ($files.Count -lt 1) { throw 'NSIS installer must exist' }
+          foreach ($file in $files) {
+            if ($signedNames -cnotcontains $file.Name) { throw "Installer was not signed by sign-windows.ps1: $($file.Name)" }
+          }
           foreach ($file in $files) {
             $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
             $subjectMatches = [bool]($signature.SignerCertificate -and $signature.SignerCertificate.Subject -ceq $env:WINDOWS_PUBLISHER)
