@@ -797,6 +797,19 @@ jobs:
           prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
           args: ${{ matrix.args }}${{ steps.windows-signing.outputs.args && format(' {0}', steps.windows-signing.outputs.args) || '' }}
 
+      # Public, fixed-format facts written by scripts/sign-windows.ps1 per signed
+      # file; shown even when the confidential build step failed.
+      - name: Show Windows signing facts
+        if: always() && runner.os == 'Windows' && vars.WINDOWS_SIGNING_BACKEND != '' && vars.WINDOWS_SIGNING_BACKEND != 'none'
+        shell: pwsh
+        run: |
+          $facts = Join-Path $env:RUNNER_TEMP 'windows-signing-facts.txt'
+          if (Test-Path -LiteralPath $facts) {
+            Get-Content -LiteralPath $facts | Where-Object { $_ -match '^SIGNFACT [A-Za-z0-9=._ -]+$' }
+          } else {
+            'SIGNFACT none: the signing command was never invoked'
+          }
+
       # Since macOS 26 the app icon ships as Contents/Resources/Assets.car plus
       # CFBundleIconName. Tauri skips that step with only a log line when the
       # toolchain cannot produce it, and the app silently shows the legacy icon.
@@ -824,6 +837,9 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:WINDOWS_PUBLISHER)) { throw 'WINDOWS_PUBLISHER is required' }
           foreach ($file in $files) {
             $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            $subjectMatches = [bool]($signature.SignerCertificate -and $signature.SignerCertificate.Subject -ceq $env:WINDOWS_PUBLISHER)
+            $name = $file.Name -replace '[^A-Za-z0-9._-]', '_'
+            "VERIFY name=$name status=$($signature.Status) subjectMatches=$subjectMatches timestamped=$([bool]$signature.TimeStamperCertificate)"
             if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or
                 $signature.SignerCertificate.Subject -cne $env:WINDOWS_PUBLISHER -or
                 -not $signature.TimeStamperCertificate) {
