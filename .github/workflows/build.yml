@@ -863,6 +863,46 @@ jobs:
             }
           }
 
+      # Tauri notarizes and staples the .app; the DMG that contains it is only
+      # signed. Notarize and staple the DMG here and replace the asset that the
+      # Tauri step uploaded into the reserved draft.
+      - name: Notarize and staple the macOS DMG in the reserved draft
+        if: matrix.platform == 'macos-15' && vars.APPLE_NOTARIZE_METHOD != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.reserve.outputs.release_id }}
+          APPLE_NOTARIZE_METHOD: ${{ vars.APPLE_NOTARIZE_METHOD }}
+        run: |
+          set -euo pipefail
+          root=src-tauri/target/aarch64-apple-darwin/release/bundle
+          dmg=$(find "$root/dmg" -maxdepth 1 -name '*.dmg' -print -quit)
+          [ -n "$dmg" ] || { echo "::error::DMG not found"; exit 1; }
+          name=$(basename "$dmg")
+          [[ "$name" =~ ^echo_[0-9A-Za-z.-]+_aarch64\.dmg$ ]] || { echo "::error::unexpected DMG name"; exit 1; }
+          result="$RUNNER_TEMP/dmg-notarization.json"
+          # The API key is passed as a file path; no credential appears in argv.
+          [ "$APPLE_NOTARIZE_METHOD" = api-key ] \
+            || { echo "::error::DMG notarization requires APPLE_NOTARIZE_METHOD=api-key"; exit 1; }
+          [ -f "$APPLE_API_KEY_PATH" ] || { echo "::error::notarization API key file missing"; exit 1; }
+          xcrun notarytool submit "$dmg" --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" --wait --timeout 45m --output-format json > "$result"
+          status=$(jq -r '.status // empty' "$result")
+          [ "$status" = Accepted ] || { echo "::error::DMG notarization status: ${status:-missing}"; exit 1; }
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+
+          assets=$(gh api "repos/$REPO/releases/$RELEASE_ID/assets?per_page=100")
+          count=$(jq --arg name "$name" '[.[] | select(.name == $name)] | length' <<<"$assets")
+          [ "$count" = 1 ] || { echo "::error::expected exactly one uploaded $name, found $count"; exit 1; }
+          old_id=$(jq -r --arg name "$name" '.[] | select(.name == $name) | .id' <<<"$assets")
+          gh api -X DELETE "repos/$REPO/releases/assets/$old_id" > /dev/null
+          upload=$(python3 _release-ci/scripts/upload-release-asset.py "$REPO" "$RELEASE_ID" "$name" "$dmg")
+          new_id=$(jq -er '.id | select(type == "number" and . > 0)' <<<"$upload") \
+            || { echo "::error::stapled DMG upload returned no valid asset id"; exit 1; }
+          echo "stapled $name uploaded as asset $new_id"
+
       - name: Verify explicitly enabled macOS notarization
         if: matrix.platform == 'macos-15' && vars.APPLE_NOTARIZE_METHOD != ''
         shell: bash
@@ -871,7 +911,8 @@ jobs:
           root=src-tauri/target/aarch64-apple-darwin/release/bundle
           app=$(find "$root/macos" -maxdepth 1 -name '*.app' -print -quit)
           dmg=$(find "$root/dmg" -maxdepth 1 -name '*.dmg' -print -quit)
-          test -n "$app" && test -n "$dmg"
+          [ -n "$app" ] || { echo "::error::app not found"; exit 1; }
+          [ -n "$dmg" ] || { echo "::error::DMG not found"; exit 1; }
           codesign --verify --deep --strict "$app"
           xcrun stapler validate "$app"
           xcrun stapler validate "$dmg"
