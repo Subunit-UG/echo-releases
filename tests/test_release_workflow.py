@@ -564,6 +564,7 @@ class ReleaseWorkflowContract(unittest.TestCase):
                 "APPLE_API_ISSUER": "I",
                 "REPO": "o/r",
                 "RELEASE_ID": "1",
+                "TAG": "v0.6.96",
                 "GH_TOKEN": "t",
                 "NOTARY_STATUS": "Accepted",
                 "ASSETS": one,
@@ -590,6 +591,7 @@ class ReleaseWorkflowContract(unittest.TestCase):
                 {"APPLE_NOTARIZE_METHOD": "apple-id"},
                 {"APPLE_API_KEY_PATH": str(root / "missing.p8")},
                 {"ASSETS": "[]"},
+                {"TAG": "v0.6.97"},
                 {"ASSETS": json.dumps([{"name": "echo_0.6.96_aarch64.dmg", "id": 7}] * 2)},
             ):
                 with self.subTest(overrides=overrides):

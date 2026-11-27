@@ -873,6 +873,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           RELEASE_ID: ${{ needs.reserve.outputs.release_id }}
+          TAG: ${{ needs.prepare.outputs.tag }}
           APPLE_NOTARIZE_METHOD: ${{ vars.APPLE_NOTARIZE_METHOD }}
         run: |
           set -euo pipefail
@@ -880,7 +881,7 @@ jobs:
           dmg=$(find "$root/dmg" -maxdepth 1 -name '*.dmg' -print -quit)
           [ -n "$dmg" ] || { echo "::error::DMG not found"; exit 1; }
           name=$(basename "$dmg")
-          [[ "$name" =~ ^echo_[0-9A-Za-z.-]+_aarch64\.dmg$ ]] || { echo "::error::unexpected DMG name"; exit 1; }
+          [ "$name" = "echo_${TAG#v}_aarch64.dmg" ] || { echo "::error::unexpected DMG name"; exit 1; }
           result="$RUNNER_TEMP/dmg-notarization.json"
           # The API key is passed as a file path; no credential appears in argv.
           [ "$APPLE_NOTARIZE_METHOD" = api-key ] \
