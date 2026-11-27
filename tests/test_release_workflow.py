@@ -535,7 +535,34 @@ class ReleaseWorkflowContract(unittest.TestCase):
         self.assertIn("MAC_TRUST_REQUIRED: ${{ needs.prepare.outputs.requires_macos_trust }}", WORKFLOW)
         promote = (ROOT / ".github" / "workflows" / "promote-stable.yml").read_text(encoding="utf-8")
         self.assertIn("if: needs.proof.outputs.requires_macos_trust == 'true'", promote)
-        self.assertIn('[ "$MAC_REQUIRED" = true ] && [ "$MAC_RESULT" = success ]', promote)
+
+    def test_promote_native_gate_runtime_is_fail_closed(self) -> None:
+        promote = (ROOT / ".github" / "workflows" / "promote-stable.yml").read_text(encoding="utf-8")
+        start = promote.index("      - name: Require native macOS gate always")
+        run_index = promote.index("\n        run: |\n", start) + len("\n        run: |\n")
+        lines = []
+        for line in promote[run_index:].splitlines():
+            if line and not line.startswith("          "):
+                break
+            lines.append(line[10:] if line else "")
+        script = "\n".join(lines) + "\n"
+        good = "a" * 64
+        base = {**os.environ, "MAC_REQUIRED": "true", "REQUIRED": "false", "MAC_RESULT": "success",
+                "WINDOWS_RESULT": "skipped", "MAC_APP": good, "MAC_DMG": good, "WIN64": "", "WINARM": ""}
+        run = lambda env: subprocess.run(["bash", "-c", script], env=env, check=False, capture_output=True, text=True)
+        self.assertEqual(run(base).returncode, 0, run(base).stderr)
+        v1 = {**base, "REQUIRED": "true", "WINDOWS_RESULT": "success", "WIN64": good, "WINARM": good}
+        self.assertEqual(run(v1).returncode, 0, run(v1).stderr)
+        for env in (
+            {**base, "MAC_REQUIRED": "false"}, {**base, "MAC_REQUIRED": ""},
+            {**base, "MAC_RESULT": "skipped"}, {**base, "MAC_RESULT": "failure"},
+            {**base, "MAC_REQUIRED": "false", "MAC_RESULT": "skipped"},
+            {**base, "MAC_APP": ""}, {**base, "MAC_DMG": "A" * 64},
+            {**base, "REQUIRED": "unexpected"}, {**base, "WINDOWS_RESULT": "success"},
+            {**v1, "WINDOWS_RESULT": "skipped"}, {**v1, "WINARM": ""},
+        ):
+            with self.subTest(env={k: env[k] for k in ("MAC_REQUIRED", "REQUIRED", "MAC_RESULT", "WINDOWS_RESULT")}):
+                self.assertNotEqual(run(env).returncode, 0)
         for tag in ("v0.6.96", "v1.0.0"):
             result = subprocess.run(
                 ["bash", str(POLICY), "workflow_dispatch", tag, tag, "stable"],

@@ -202,17 +202,19 @@ jobs:
           WINARM: ${{ needs.verify_windows_platform_trust.outputs.arm64_sha256 }}
         run: |
           set -euo pipefail
-          [ "$MAC_REQUIRED" = true ] && [ "$MAC_RESULT" = success ]
+          [ "$MAC_REQUIRED" = true ] || { echo "::error::invalid requires_macos_trust=$MAC_REQUIRED"; exit 1; }
+          [ "$MAC_RESULT" = success ] || { echo "::error::macOS platform trust result is $MAC_RESULT"; exit 1; }
           for hash in "$MAC_APP" "$MAC_DMG"; do
-            [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::invalid macOS native hash"; exit 1; }
           done
           if [ "$REQUIRED" = true ]; then
-            [ "$WINDOWS_RESULT" = success ]
+            [ "$WINDOWS_RESULT" = success ] || { echo "::error::Windows platform trust result is $WINDOWS_RESULT"; exit 1; }
             for hash in "$WIN64" "$WINARM"; do
-              [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
+              [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::invalid Windows native hash"; exit 1; }
             done
           else
-            [ "$REQUIRED" = false ] && [ "$WINDOWS_RESULT" = skipped ]
+            [ "$REQUIRED" = false ] || { echo "::error::invalid requires_platform_trust=$REQUIRED"; exit 1; }
+            [ "$WINDOWS_RESULT" = skipped ] || { echo "::error::unexpected Windows trust result $WINDOWS_RESULT"; exit 1; }
           fi
       - name: Install Minisign
         run: sudo apt-get update && sudo apt-get install -y minisign
