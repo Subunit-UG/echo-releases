@@ -684,6 +684,16 @@ jobs:
             default { throw 'Unsupported cloud signing backend' }
           }
           "WINDOWS_SIGNING_CONFIG=$configPath" >> $env:GITHUB_ENV
+          # Signing runs at the end of the Tauri build, long after azure/login.
+          # The OIDC client assertion is short-lived, so acquire the access token
+          # for the signing service now; AzureCliCredential later reads it from
+          # the CLI token cache.
+          $scope = switch -CaseSensitive ($env:WINDOWS_SIGNING_BACKEND) {
+            'artifact-signing' { 'https://codesigning.azure.net/.default' }
+            'azure-key-vault' { 'https://vault.azure.net/.default' }
+          }
+          & az account get-access-token --scope $scope --output none
+          if ($LASTEXITCODE -ne 0) { throw 'signing service access token unavailable' }
           $scriptPath = Join-Path $env:GITHUB_WORKSPACE '_release-ci/scripts/sign-windows.ps1'
           @{
             bundle = @{
