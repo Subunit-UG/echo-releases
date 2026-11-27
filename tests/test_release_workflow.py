@@ -522,6 +522,17 @@ class ReleaseWorkflowContract(unittest.TestCase):
             self.assertIn(f"repository variable {variable} is required for {scope}", WORKFLOW)
             self.assertIn(f"`{variable}`", PLATFORM_TRUST_DOC)
 
+    def test_windows_signing_token_is_acquired_right_after_azure_login(self) -> None:
+        login = WORKFLOW.index("      - name: Azure OIDC login for Windows signing\n")
+        prepare = WORKFLOW.index("      - name: Prepare Windows cloud signing\n")
+        tauri = WORKFLOW.index("      - uses: ./_release-ci/.github/actions/confidential-tauri\n")
+        self.assertLess(login, prepare)
+        block = WORKFLOW[prepare:tauri]
+        self.assertIn("'artifact-signing' { 'https://codesigning.azure.net/.default' }", block)
+        self.assertIn("'azure-key-vault' { 'https://vault.azure.net/.default' }", block)
+        self.assertIn("& az account get-access-token --scope $scope --output none", block)
+        self.assertIn("throw 'signing service access token unavailable'", block)
+
     def test_dmg_notarization_step_runtime_replaces_exactly_one_asset(self) -> None:
         script = workflow_run_block("      - name: Notarize and staple the macOS DMG in the reserved draft\n")
         self.assertNotIn("--password", script)
