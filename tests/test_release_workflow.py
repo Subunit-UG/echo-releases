@@ -522,6 +522,93 @@ class ReleaseWorkflowContract(unittest.TestCase):
             self.assertIn(f"repository variable {variable} is required for {scope}", WORKFLOW)
             self.assertIn(f"`{variable}`", PLATFORM_TRUST_DOC)
 
+    def test_dmg_notarization_step_runtime_replaces_exactly_one_asset(self) -> None:
+        script = workflow_run_block("      - name: Notarize and staple the macOS DMG in the reserved draft\n")
+        self.assertNotIn("--password", script)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            bundle = root / "src-tauri/target/aarch64-apple-darwin/release/bundle/dmg"
+            bundle.mkdir(parents=True)
+            (bundle / "echo_0.6.96_aarch64.dmg").write_bytes(b"dmg")
+            (root / "_release-ci/scripts").mkdir(parents=True)
+            (root / "_release-ci/scripts/upload-release-asset.py").write_text(
+                "import json, os, sys\n"
+                "open(os.environ['CALLS'], 'a').write('upload ' + sys.argv[3] + '\\n')\n"
+                "print(json.dumps({'id': 99}))\n"
+            )
+            stubs = root / "bin"
+            stubs.mkdir()
+            (stubs / "xcrun").write_text(
+                "#!/bin/bash\necho \"xcrun $1 $2\" >> \"$CALLS\"\n"
+                "if [ \"$1\" = notarytool ]; then echo \"{\\\"status\\\": \\\"$NOTARY_STATUS\\\"}\"; fi\n"
+                "if [ \"$1\" = stapler ] && [ -n \"${STAPLE_FAIL:-}\" ]; then exit 65; fi\n"
+            )
+            (stubs / "gh").write_text(
+                "#!/bin/bash\necho \"gh $*\" >> \"$CALLS\"\n"
+                "case \"$*\" in *DELETE*) exit 0 ;; esac\n"
+                "printf '%s' \"$ASSETS\"\n"
+            )
+            for stub in ("xcrun", "gh"):
+                (stubs / stub).chmod(0o755)
+            key = root / "key.p8"
+            key.write_text("k")
+            one = json.dumps([{"name": "echo_0.6.96_aarch64.dmg", "id": 7}, {"name": "latest.json", "id": 8}])
+            base = {
+                **os.environ,
+                "PATH": f"{stubs}:{os.environ['PATH']}",
+                "RUNNER_TEMP": temporary,
+                "CALLS": str(root / "calls"),
+                "APPLE_NOTARIZE_METHOD": "api-key",
+                "APPLE_API_KEY_PATH": str(key),
+                "APPLE_API_KEY": "K",
+                "APPLE_API_ISSUER": "I",
+                "REPO": "o/r",
+                "RELEASE_ID": "1",
+                "TAG": "v0.6.96",
+                "GH_TOKEN": "t",
+                "NOTARY_STATUS": "Accepted",
+                "ASSETS": one,
+            }
+
+            def run(**overrides):
+                (root / "calls").write_text("")
+                return subprocess.run(
+                    ["bash", "-c", script], cwd=root, env={**base, **overrides},
+                    check=False, capture_output=True, text=True,
+                )
+
+            ok = run()
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            calls = (root / "calls").read_text()
+            self.assertIn("xcrun stapler staple", calls)
+            self.assertIn("releases/assets/7", calls)
+            self.assertIn("upload echo_0.6.96_aarch64.dmg", calls)
+            self.assertLess(calls.index("stapler validate"), calls.index("releases/assets/7"))
+            for overrides in (
+                {"NOTARY_STATUS": "Invalid"},
+                {"NOTARY_STATUS": ""},
+                {"STAPLE_FAIL": "1"},
+                {"APPLE_NOTARIZE_METHOD": "apple-id"},
+                {"APPLE_API_KEY_PATH": str(root / "missing.p8")},
+                {"ASSETS": "[]"},
+                {"TAG": "v0.6.97"},
+                {"ASSETS": json.dumps([{"name": "echo_0.6.96_aarch64.dmg", "id": 7}] * 2)},
+            ):
+                with self.subTest(overrides=overrides):
+                    rejected = run(**overrides)
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertNotIn("DELETE", (root / "calls").read_text())
+
+    def test_macos_verifier_requires_notarized_developer_id_source_and_apple_anchor(self) -> None:
+        verifier = MACOS_VERIFIER.read_text(encoding="utf-8")
+        self.assertIn("grep -Fqx 'source=Notarized Developer ID'", verifier)
+        self.assertIn('anchor apple generic and certificate leaf[subject.OU] = \\"$expected_team_id\\"', verifier)
+        self.assertIn('verify_apple_anchor "$app" "$label"', verifier)
+        self.assertIn('verify_gatekeeper_source "$label" --type execute "$app"', verifier)
+        self.assertIn('verify_apple_anchor "$dmg" "DMG"', verifier)
+        self.assertIn('verify_gatekeeper_source "DMG" --type open --context context:primary-signature "$dmg"', verifier)
+        self.assertNotIn("spctl --assess --type execute --verbose=4 \"$app\"\n", verifier)
+
     def test_every_macos_release_requires_native_trust(self) -> None:
         self.assertIn(
             "requires_macos_trust: ${{ steps.policy.outputs.requires_macos_trust }}", WORKFLOW
@@ -714,8 +801,9 @@ class PlatformVerifierContract(unittest.TestCase):
             "TeamIdentifier=$expected_team_id",
             'verify_signer_metadata "$dmg" "DMG"',
             "xcrun stapler validate",
-            "spctl --assess --type execute",
-            "spctl --assess --type open",
+            'spctl --assess "$@" --verbose=4',
+            "--type execute",
+            "--type open --context context:primary-signature",
             "hdiutil attach",
             "validate-macos-app-archive.py",
             "CFBundleShortVersionString",

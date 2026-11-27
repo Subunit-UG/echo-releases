@@ -45,6 +45,10 @@ def main() -> int:
         f"https://uploads.github.com/repos/{args.repository}/releases/"
         f"{args.release_id}/assets?name={quote(args.asset_name, safe='')}"
     )
+    content_type = {
+        ".json": "application/json",
+        ".dmg": "application/x-apple-diskimage",
+    }.get(Path(args.asset_name).suffix.lower(), "application/octet-stream")
     request = Request(
         url,
         data=payload,
@@ -52,7 +56,7 @@ def main() -> int:
         headers={
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
+            "Content-Type": content_type,
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )

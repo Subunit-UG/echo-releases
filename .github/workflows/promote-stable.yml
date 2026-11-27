@@ -112,8 +112,8 @@ jobs:
           APPLE_SIGNING_AUTHORITY: ${{ vars.APPLE_SIGNING_AUTHORITY }}
         run: |
           set -euo pipefail
-          [ -n "$APPLE_TEAM_ID" ] || { echo "::error::repository variable APPLE_TEAM_ID is required for v1+"; exit 1; }
-          [ -n "$APPLE_SIGNING_AUTHORITY" ] || { echo "::error::repository variable APPLE_SIGNING_AUTHORITY is required for v1+"; exit 1; }
+          [ -n "$APPLE_TEAM_ID" ] || { echo "::error::repository variable APPLE_TEAM_ID is required for macOS releases"; exit 1; }
+          [ -n "$APPLE_SIGNING_AUTHORITY" ] || { echo "::error::repository variable APPLE_SIGNING_AUTHORITY is required for macOS releases"; exit 1; }
           source scripts/release-assets.sh
           release_assets_load "$REPO" "$RELEASE_ID" "$TAG" "$PRERELEASE"
 
