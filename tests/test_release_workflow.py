@@ -522,6 +522,16 @@ class ReleaseWorkflowContract(unittest.TestCase):
             self.assertIn(f"repository variable {variable} is required for {scope}", WORKFLOW)
             self.assertIn(f"`{variable}`", PLATFORM_TRUST_DOC)
 
+    def test_macos_verifier_requires_notarized_developer_id_source_and_apple_anchor(self) -> None:
+        verifier = MACOS_VERIFIER.read_text(encoding="utf-8")
+        self.assertIn("grep -Fqx 'source=Notarized Developer ID'", verifier)
+        self.assertIn('anchor apple generic and certificate leaf[subject.OU] = \\"$expected_team_id\\"', verifier)
+        self.assertIn('verify_apple_anchor "$app" "$label"', verifier)
+        self.assertIn('verify_gatekeeper_source "$label" --type execute "$app"', verifier)
+        self.assertIn('verify_apple_anchor "$dmg" "DMG"', verifier)
+        self.assertIn('verify_gatekeeper_source "DMG" --type open --context context:primary-signature "$dmg"', verifier)
+        self.assertNotIn("spctl --assess --type execute --verbose=4 \"$app\"\n", verifier)
+
     def test_every_macos_release_requires_native_trust(self) -> None:
         self.assertIn(
             "requires_macos_trust: ${{ steps.policy.outputs.requires_macos_trust }}", WORKFLOW
@@ -714,8 +724,9 @@ class PlatformVerifierContract(unittest.TestCase):
             "TeamIdentifier=$expected_team_id",
             'verify_signer_metadata "$dmg" "DMG"',
             "xcrun stapler validate",
-            "spctl --assess --type execute",
-            "spctl --assess --type open",
+            'spctl --assess "$@" --verbose=4',
+            "--type execute",
+            "--type open --context context:primary-signature",
             "hdiutil attach",
             "validate-macos-app-archive.py",
             "CFBundleShortVersionString",

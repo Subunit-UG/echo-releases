@@ -85,6 +85,26 @@ verify_signer_metadata() {
   fi
 }
 
+# Gatekeeper must attribute the artifact to a notarized Developer ID, and the
+# leaf certificate must chain to Apple and belong to the expected team.
+verify_gatekeeper_source() {
+  local label="$1"
+  shift
+  local assessment
+  assessment="$(spctl --assess "$@" --verbose=4 2>&1)" \
+    || { echo "error: $label was rejected by Gatekeeper" >&2; exit 1; }
+  printf '%s\n' "$assessment" | grep -Fqx 'source=Notarized Developer ID' \
+    || { echo "error: $label is not assessed as Notarized Developer ID" >&2; exit 1; }
+}
+
+verify_apple_anchor() {
+  local artifact="$1"
+  local label="$2"
+  codesign --verify --strict \
+    -R="anchor apple generic and certificate leaf[subject.OU] = \"$expected_team_id\"" "$artifact" \
+    || { echo "error: $label does not satisfy the Apple Developer ID requirement" >&2; exit 1; }
+}
+
 verify_app() {
   local app="$1"
   local label="$2"
@@ -105,7 +125,8 @@ verify_app() {
   [ "$bundle_version" = "$expected_version" ] \
     || { echo "error: $label has CFBundleVersion=$bundle_version, expected $expected_version" >&2; exit 1; }
   xcrun stapler validate "$app"
-  spctl --assess --type execute --verbose=4 "$app"
+  verify_apple_anchor "$app" "$label"
+  verify_gatekeeper_source "$label" --type execute "$app"
 }
 
 archive_app="$(find_single_app "$archive_dir" "updater archive")"
@@ -114,7 +135,8 @@ verify_app "$archive_app" "updater archive app"
 codesign --verify --strict --verbose=2 "$dmg"
 verify_signer_metadata "$dmg" "DMG"
 xcrun stapler validate "$dmg"
-spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg"
+verify_apple_anchor "$dmg" "DMG"
+verify_gatekeeper_source "DMG" --type open --context context:primary-signature "$dmg"
 
 hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount_dir" -quiet
 mounted=true
