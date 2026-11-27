@@ -14,6 +14,9 @@ SPEC = importlib.util.spec_from_file_location('held', ROOT / 'scripts/held-stabl
 held = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(held)
 
 
+MAC_NATIVE = {'NATIVE_MAC_APP': 'b'*64, 'NATIVE_MAC_DMG': 'b'*64}
+
+
 class HeldStableTests(unittest.TestCase):
     def setUp(self):
         self.source = 'a' * 40; self.tag = 'v0.6.11'; self.repo = 'Subunit-UG/echo-releases'
@@ -31,7 +34,8 @@ class HeldStableTests(unittest.TestCase):
                         status='completed',conclusion='success',head_sha='c'*40)
         self.jobs = [dict(name=f'build ({platform}, --features local)',conclusion='success') for platform in
                      ('ubuntu-24.04','windows-latest','windows-11-arm','macos-15')]
-        self.jobs += [dict(name=name,conclusion='success') for name in ('verify_updater_trust','platform_trust','publish')]
+        self.jobs += [dict(name=name,conclusion='success') for name in
+                      ('verify_updater_trust','verify_macos_platform_trust','platform_trust','publish')]
 
     def validate(self):
         return held.validate_receipt(self.receipt,self.release,self.source,self.tag,20)
@@ -104,7 +108,8 @@ class HeldStableTests(unittest.TestCase):
         hosts=re.findall(r'^          - platform: (\S+)$',build,re.M)
         self.assertEqual(len(hosts),4)
         jobs=[dict(name=f'build ({host}, --features local)',conclusion='success') for host in hosts]
-        jobs+=[dict(name=name,conclusion='success') for name in ('verify_updater_trust','platform_trust','publish')]
+        jobs+=[dict(name=name,conclusion='success') for name in
+               ('verify_updater_trust','verify_macos_platform_trust','platform_trust','publish')]
         held.validate_run(self.receipt,self.run,jobs,self.repo)
 
     def test_run_attempt_and_revision_and_event_pins(self):
@@ -116,8 +121,17 @@ class HeldStableTests(unittest.TestCase):
     def test_native_policy_requires_both_jobs(self):
         receipt=dict(self.receipt,requires_platform_trust=True)
         with self.assertRaises(ValueError): held.validate_run(receipt,self.run,self.jobs,self.repo)
-        jobs=self.jobs+[dict(name=name,conclusion='success') for name in ('verify_macos_platform_trust','verify_windows_platform_trust')]
+        jobs=self.jobs+[dict(name='verify_windows_platform_trust',conclusion='success')]
         held.validate_run(receipt,self.run,jobs,self.repo)
+
+    def test_zero_x_still_requires_successful_macos_trust(self):
+        held.validate_run(self.receipt,self.run,self.jobs,self.repo)
+        for conclusion in (None,'skipped','failure'):
+            with self.subTest(conclusion=conclusion):
+                jobs=[job for job in self.jobs if job['name']!='verify_macos_platform_trust']
+                if conclusion: jobs.append(dict(name='verify_macos_platform_trust',conclusion=conclusion))
+                with self.assertRaisesRegex(ValueError,'native trust missing'):
+                    held.validate_run(self.receipt,self.run,jobs,self.repo)
 
     def test_manifest_binds_all_aliases_urls_signatures(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -175,7 +189,7 @@ class PromotionWriteBoundary(unittest.TestCase):
         calls=[]
         def api(repo, route, *extra, **kwargs):
             calls.append((route,extra)); return published
-        with patch.object(held.sys,'argv',args), patch.object(held,'verify',return_value=(case.receipt,held.inventory(case.release))), patch.object(held,'api',side_effect=api):
+        with patch.object(held.sys,'argv',args), patch.object(held,'verify',return_value=(case.receipt,held.inventory(case.release))), patch.object(held,'api',side_effect=api), patch.dict('os.environ',MAC_NATIVE):
             self.assertEqual(held.main(),0)
         self.assertEqual(len(calls),3)
         self.assertEqual(calls[0][0],'releases/20')
@@ -196,7 +210,7 @@ class PromotionWriteBoundary(unittest.TestCase):
                 def api(repo, route, *extra, **kwargs):
                     calls.append((route,extra,kwargs))
                     return latest if route=='releases/latest' else published
-                with patch.object(held.sys,'argv',args), patch.object(held,'verify',return_value=(case.receipt,held.inventory(case.release))), patch.object(held,'api',side_effect=api), patch.object(held.time,'sleep') as sleep, contextlib.redirect_stdout(output):
+                with patch.object(held.sys,'argv',args), patch.object(held,'verify',return_value=(case.receipt,held.inventory(case.release))), patch.object(held,'api',side_effect=api), patch.object(held.time,'sleep') as sleep, patch.dict('os.environ',MAC_NATIVE), contextlib.redirect_stdout(output):
                     with self.assertRaisesRegex(ValueError,'did not converge'): held.main()
                 self.assertEqual(sum('PATCH' in extra for _,extra,_ in calls),1)
                 reads=[call for call in calls if call[0]=='releases/latest']
@@ -223,6 +237,15 @@ class PromotionWriteBoundary(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'did not converge'):
                 held.verify_latest(args,case.receipt,held.inventory(case.release))
             self.assertEqual(api.call_count,5)
+
+    def test_zero_x_publish_requires_exact_macos_native_hashes(self):
+        case=HeldStableTests(); case.setUp()
+        args=['held-stable.py','publish','--repo',case.repo,'--release-id','20',
+              '--source-commit',case.source,'--tag',case.tag,'--directory','unused']
+        for env in ({}, {'NATIVE_MAC_APP':'b'*64}, {'NATIVE_MAC_APP':'b'*64,'NATIVE_MAC_DMG':'e'*64}):
+            with self.subTest(env=env), patch.object(held.sys,'argv',args), patch.object(held,'verify',return_value=(case.receipt,held.inventory(case.release))), patch.object(held,'api') as api, patch.dict('os.environ',env,clear=True):
+                with self.assertRaisesRegex(ValueError,'native trust hash'): held.main()
+                api.assert_not_called()
 
     def test_v1_publish_requires_exact_native_hashes(self):
         case=HeldStableTests(); case.setUp(); case.receipt['requires_platform_trust']=True

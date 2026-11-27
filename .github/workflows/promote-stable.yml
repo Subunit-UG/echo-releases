@@ -33,6 +33,7 @@ jobs:
       contents: write
     outputs:
       requires_platform_trust: ${{ steps.policy.outputs.requires_platform_trust }}
+      requires_macos_trust: ${{ steps.policy.outputs.requires_macos_trust }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Minisign
@@ -85,7 +86,7 @@ jobs:
 
   verify_macos_platform_trust:
     needs: proof
-    if: needs.proof.outputs.requires_platform_trust == 'true'
+    if: needs.proof.outputs.requires_macos_trust == 'true'
     runs-on: macos-15
     # GitHub exposes unpublished draft releases only to push-capable tokens.
     # The verifier remains read-only; the workflow contract forbids mutations.
@@ -189,9 +190,10 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Require native gates for v1+, compare exact held hashes
+      - name: Require native macOS gate always and Windows gate for v1+, compare exact held hashes
         env:
           REQUIRED: ${{ needs.proof.outputs.requires_platform_trust }}
+          MAC_REQUIRED: ${{ needs.proof.outputs.requires_macos_trust }}
           MAC_RESULT: ${{ needs.verify_macos_platform_trust.result }}
           WINDOWS_RESULT: ${{ needs.verify_windows_platform_trust.result }}
           MAC_APP: ${{ needs.verify_macos_platform_trust.outputs.app_archive_sha256 }}
@@ -200,13 +202,17 @@ jobs:
           WINARM: ${{ needs.verify_windows_platform_trust.outputs.arm64_sha256 }}
         run: |
           set -euo pipefail
+          [ "$MAC_REQUIRED" = true ] && [ "$MAC_RESULT" = success ]
+          for hash in "$MAC_APP" "$MAC_DMG"; do
+            [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
+          done
           if [ "$REQUIRED" = true ]; then
-            [ "$MAC_RESULT" = success ] && [ "$WINDOWS_RESULT" = success ]
-            for hash in "$MAC_APP" "$MAC_DMG" "$WIN64" "$WINARM"; do
+            [ "$WINDOWS_RESULT" = success ]
+            for hash in "$WIN64" "$WINARM"; do
               [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
             done
           else
-            [ "$REQUIRED" = false ] && [ "$MAC_RESULT" = skipped ] && [ "$WINDOWS_RESULT" = skipped ]
+            [ "$REQUIRED" = false ] && [ "$WINDOWS_RESULT" = skipped ]
           fi
       - name: Install Minisign
         run: sudo apt-get update && sudo apt-get install -y minisign

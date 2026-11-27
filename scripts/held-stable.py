@@ -140,10 +140,13 @@ def validate_run(receipt, run, jobs, repo):
     for name in ('verify_updater_trust', 'platform_trust', 'publish'):
         matches = [job for job in jobs if job['name'] == name]
         require(len(matches) == 1 and matches[0].get('conclusion') == 'success', 'missing successful trust/seal job')
+    # macOS native trust (Developer ID + notarization) is required for every release.
+    native_jobs = ['verify_macos_platform_trust']
     if receipt['requires_platform_trust']:
-        for name in ('verify_macos_platform_trust', 'verify_windows_platform_trust'):
-            matches = [job for job in jobs if job['name'] == name]
-            require(len(matches) == 1 and matches[0].get('conclusion') == 'success', 'native trust missing')
+        native_jobs.append('verify_windows_platform_trust')
+    for name in native_jobs:
+        matches = [job for job in jobs if job['name'] == name]
+        require(len(matches) == 1 and matches[0].get('conclusion') == 'success', 'native trust missing')
 
 
 def names(tag):
@@ -290,13 +293,15 @@ def main():
     else:
         receipt, verified_assets = verify(args)
         if args.action == 'publish':
+            import os
+            native = [('echo_aarch64.app.tar.gz', 'NATIVE_MAC_APP'),
+                      (f'echo_{args.tag[1:]}_aarch64.dmg', 'NATIVE_MAC_DMG')]
             if receipt['requires_platform_trust']:
-                import os
-                native_names = ['echo_aarch64.app.tar.gz', f'echo_{args.tag[1:]}_aarch64.dmg',
-                                f'echo_{args.tag[1:]}_x64-setup.exe', f'echo_{args.tag[1:]}_arm64-setup.exe']
-                for name, variable in zip(native_names, ('NATIVE_MAC_APP', 'NATIVE_MAC_DMG', 'NATIVE_WIN64', 'NATIVE_WINARM')):
-                    require(os.environ.get(variable) == receipt['assets'][name]['sha256'],
-                            'native trust hash missing/mismatched')
+                native += [(f'echo_{args.tag[1:]}_x64-setup.exe', 'NATIVE_WIN64'),
+                           (f'echo_{args.tag[1:]}_arm64-setup.exe', 'NATIVE_WINARM')]
+            for name, variable in native:
+                require(os.environ.get(variable) == receipt['assets'][name]['sha256'],
+                        'native trust hash missing/mismatched')
             result = api(args.repo, f'releases/{args.release_id}', '-X', 'PATCH',
                          '-f', f'tag_name={args.tag}', '-F', 'draft=false', '-F', 'prerelease=false', '-f', 'make_latest=true')
             require(result.get('id') == args.release_id and result.get('tag_name') == args.tag and

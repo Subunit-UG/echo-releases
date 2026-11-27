@@ -28,17 +28,22 @@ nach dem Upload von `latest.json` nochmals. `latest.json` wird über die numeris
 Release-ID hochgeladen; die Tag-basierte Asset-Auswahl ist damit auch an dieser
 Stelle ausgeschlossen.
 
-## Native Plattformprüfung ab 1.0
+## Native Plattformprüfung
 
-Der Release-Workflow verlangt zusätzlich für jede Version ab `v1.0.0`, einschließlich Tags
-wie `v1.0.0-rc.1`, eine erfolgreiche Prüfung der bereits hochgeladenen nativen
-Artefakte. Versionen mit Major `0` behalten den bisherigen Releasepfad. Die
-Entscheidung kommt ausschließlich aus `scripts/release_policy.sh`.
+macOS: Jede Version, auch mit Major `0`, braucht eine erfolgreiche native Prüfung
+der hochgeladenen macOS-Artefakte (Developer-ID-Signatur mit Team-ID, Notarisierung,
+Stapling, Gatekeeper).
+
+Windows: Der Release-Workflow verlangt die native Prüfung für jede Version ab
+`v1.0.0`, einschließlich Tags wie `v1.0.0-rc.1`.
+
+Beide Entscheidungen kommen ausschließlich aus `scripts/release_policy.sh`
+(`requires_macos_trust`, `requires_platform_trust`).
 
 ## Öffentliche Repository-Variablen
 
-Vor einem 1.0-Build müssen in den GitHub-Actions-Variablen des Release-Repositories
-diese öffentlichen Identitäten gesetzt sein:
+In den GitHub-Actions-Variablen des Release-Repositories müssen diese öffentlichen
+Identitäten gesetzt sein (die Apple-Werte für jeden Build, der Windows-Wert ab 1.0):
 
 - `APPLE_TEAM_ID`: exakter Apple-Team-Identifier der erwarteten Developer-ID-Signatur.
 - `APPLE_SIGNING_AUTHORITY`: vollständiger Wert der erwarteten Leaf-Zeile
@@ -47,7 +52,7 @@ diese öffentlichen Identitäten gesetzt sein:
 
 Diese Werte sind keine Signing-Credentials. Der Workflow liest damit nur die
 Identität bereits signierter Dateien. Fehlende oder abweichende Werte stoppen
-einen 1.0+-Lauf. Die Wahl und Einrichtung eines Signing-Anbieters ist nicht Teil
+den Lauf. Die Wahl und Einrichtung eines Signing-Anbieters ist nicht Teil
 dieses Gates.
 
 ## Geprüfte Artefakte
@@ -82,8 +87,9 @@ Der Windows-Job prüft:
 Die nativen Jobs geben SHA-256-Werte der vier geprüften OS-Artefakte weiter.
 `platform_trust` verlangt für macOS-Updaterarchiv und beide Windows-Installer
 zusätzlich Gleichheit mit den Hashes des Updater-Gates. Der Publish-Job prüft die
-Bytes erneut. Für 0.x entfällt ausschließlich diese native Zusatzprüfung; die
-kryptografische Vier-Plattform-Updaterprüfung bleibt Pflicht.
+Bytes erneut. Für 0.x entfällt ausschließlich die native Windows-Prüfung; die
+native macOS-Prüfung und die kryptografische Vier-Plattform-Updaterprüfung bleiben
+Pflicht.
 
 ## Externe Voraussetzungen vor GA
 

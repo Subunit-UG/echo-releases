@@ -117,7 +117,14 @@ class ReleaseWorkflowContract(unittest.TestCase):
                 "if: needs.prepare.outputs.should_build == 'true' && "
                 "needs.prepare.outputs.requires_platform_trust == 'true'"
             ),
-            2,
+            1,
+        )
+        self.assertEqual(
+            workflow.count(
+                "if: needs.prepare.outputs.should_build == 'true' && "
+                "needs.prepare.outputs.requires_macos_trust == 'true'"
+            ),
+            1,
         )
         self.assertIn(
             "\n          REQUIRED: ${{ needs.prepare.outputs.requires_platform_trust }}\n",
@@ -302,6 +309,7 @@ class ReleaseWorkflowContract(unittest.TestCase):
             **os.environ,
             "TAG": "v1.0.0-rc.1",
             "REQUIRED": "true",
+            "MAC_REQUIRED": "true",
             "UPDATER_RESULT": "success",
             "UPDATER_EVIDENCE": json.dumps(evidence, separators=(",", ":")),
             "MAC_RESULT": "success",
@@ -320,6 +328,8 @@ class ReleaseWorkflowContract(unittest.TestCase):
             {"WINDOWS_ARM64_HASH": ""},
             {"MAC_DMG_HASH": "A" * 64},
             {"REQUIRED": "unexpected"},
+            {"MAC_REQUIRED": "false"},
+            {"MAC_REQUIRED": ""},
         )
         with tempfile.TemporaryDirectory() as temporary:
             output = pathlib.Path(temporary) / "github-output"
@@ -352,25 +362,37 @@ class ReleaseWorkflowContract(unittest.TestCase):
             ):
                 self.assertIn(f"{output_name}={valid_hash}\n", emitted)
 
-            legacy = subprocess.run(
-                ["bash", "-c", script],
-                env={
-                    **base_env,
-                    "REQUIRED": "false",
-                    "TAG": "v0.5.166",
-                    "MAC_RESULT": "skipped",
-                    "WINDOWS_RESULT": "skipped",
-                    "UPDATER_EVIDENCE": json.dumps(evidence, separators=(",", ":")).replace(
-                        "1.0.0-rc.1", "0.5.166"
-                    ),
-                    "GITHUB_OUTPUT": str(output),
-                },
-                check=False,
-                capture_output=True,
-                text=True,
+            zero_x_env = {
+                **base_env,
+                "REQUIRED": "false",
+                "TAG": "v0.5.166",
+                "WINDOWS_RESULT": "skipped",
+                "WINDOWS_X64_HASH": "",
+                "WINDOWS_ARM64_HASH": "",
+                "UPDATER_EVIDENCE": json.dumps(evidence, separators=(",", ":")).replace(
+                    "1.0.0-rc.1", "0.5.166"
+                ),
+                "GITHUB_OUTPUT": str(output),
+            }
+            zero_x = subprocess.run(
+                ["bash", "-c", script], env=zero_x_env, check=False, capture_output=True, text=True,
             )
-            self.assertEqual(legacy.returncode, 0, legacy.stderr)
-            self.assertIn("0.x release", legacy.stdout)
+            self.assertEqual(zero_x.returncode, 0, zero_x.stderr)
+            self.assertIn("0.x release", zero_x.stdout)
+            # 0.x without a successful Developer ID / notarization check must not publish.
+            for overrides in (
+                {"MAC_RESULT": "skipped"},
+                {"MAC_RESULT": "failure"},
+                {"MAC_APP_HASH": ""},
+                {"MAC_DMG_HASH": ""},
+                {"MAC_APP_HASH": "b" * 64},
+            ):
+                with self.subTest(zero_x=overrides):
+                    rejected = subprocess.run(
+                        ["bash", "-c", script], env={**zero_x_env, **overrides},
+                        check=False, capture_output=True, text=True,
+                    )
+                    self.assertNotEqual(rejected.returncode, 0)
 
     def test_contract_rejects_each_publish_bypass_mutation(self) -> None:
         mutations = {
@@ -488,17 +510,39 @@ class ReleaseWorkflowContract(unittest.TestCase):
         for field in ("id", "sha256", "sig_id", "sig_sha256", "signed_filename"):
             self.assertIn(field, WORKFLOW)
         self.assertIn('signed_names=("echo.app.tar.gz" "$linux" "$win64" "$winarm")', WORKFLOW)
-        self.assertIn("0.x release: cryptographic updater gate passed", WORKFLOW)
+        self.assertIn("0.x release: updater and macOS platform trust gates passed", WORKFLOW)
 
     def test_v1_missing_signer_identities_fail_closed_and_are_documented(self) -> None:
-        for variable in (
-            "APPLE_TEAM_ID",
-            "APPLE_SIGNING_AUTHORITY",
-            "WINDOWS_PUBLISHER",
+        for variable, scope in (
+            ("APPLE_TEAM_ID", "macOS releases"),
+            ("APPLE_SIGNING_AUTHORITY", "macOS releases"),
+            ("WINDOWS_PUBLISHER", "v1+"),
         ):
             self.assertIn(f"vars.{variable}", WORKFLOW)
-            self.assertIn(f"repository variable {variable} is required for v1+", WORKFLOW)
+            self.assertIn(f"repository variable {variable} is required for {scope}", WORKFLOW)
             self.assertIn(f"`{variable}`", PLATFORM_TRUST_DOC)
+
+    def test_every_macos_release_requires_native_trust(self) -> None:
+        self.assertIn(
+            "requires_macos_trust: ${{ steps.policy.outputs.requires_macos_trust }}", WORKFLOW
+        )
+        self.assertIn(
+            "verify_macos_platform_trust:\n    needs: [prepare, reserve, build]\n"
+            "    if: needs.prepare.outputs.should_build == 'true' && "
+            "needs.prepare.outputs.requires_macos_trust == 'true'",
+            WORKFLOW,
+        )
+        self.assertIn("MAC_TRUST_REQUIRED: ${{ needs.prepare.outputs.requires_macos_trust }}", WORKFLOW)
+        promote = (ROOT / ".github" / "workflows" / "promote-stable.yml").read_text(encoding="utf-8")
+        self.assertIn("if: needs.proof.outputs.requires_macos_trust == 'true'", promote)
+        self.assertIn('[ "$MAC_REQUIRED" = true ] && [ "$MAC_RESULT" = success ]', promote)
+        for tag in ("v0.6.96", "v1.0.0"):
+            result = subprocess.run(
+                ["bash", str(POLICY), "workflow_dispatch", tag, tag, "stable"],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("requires_macos_trust=true\n", result.stdout)
 
     def test_azure_access_is_limited_to_opt_in_signing_scope(self) -> None:
         self.assertEqual(azure_signing_scope_errors(WORKFLOW), [])
@@ -545,7 +589,8 @@ class ReleasePolicyContract(unittest.TestCase):
             stable.stdout,
             "release_mode=stable\n"
             "prerelease=false\n"
-            "requires_platform_trust=false\n",
+            "requires_platform_trust=false\n"
+            "requires_macos_trust=true\n",
         )
 
         rc = self.run_policy("workflow_dispatch", "v0.5.166-rc.1", "v0.5.166-rc.1", "draft_rc")
@@ -554,7 +599,8 @@ class ReleasePolicyContract(unittest.TestCase):
             rc.stdout,
             "release_mode=draft_rc\n"
             "prerelease=true\n"
-            "requires_platform_trust=false\n",
+            "requires_platform_trust=false\n"
+            "requires_macos_trust=true\n",
         )
 
     def test_major_one_and_later_require_platform_trust_for_stable_and_rc(self) -> None:
