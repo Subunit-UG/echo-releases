@@ -71,6 +71,7 @@ jobs:
       release_mode: ${{ steps.policy.outputs.release_mode }}
       prerelease: ${{ steps.policy.outputs.prerelease }}
       requires_platform_trust: ${{ steps.policy.outputs.requires_platform_trust }}
+      requires_macos_trust: ${{ steps.policy.outputs.requires_macos_trust }}
       should_build: ${{ steps.pick.outputs.should_build }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -279,11 +280,10 @@ jobs:
   build:
     needs: [prepare, reserve]
     if: needs.prepare.outputs.should_build == 'true'
-    # Developer-ID-Zertifikat und Notarisierungsschlüssel liegen als Secrets der
-    # Umgebung `release-signing`, deren Deployment-Regel nur `main` zulässt. Ein
-    # Workflow auf einem anderen Zweig (auch per push eines Schreibberechtigten)
-    # bekommt sie dadurch nicht, die Apple-vertraute Identität bleibt im
-    # geprüften Release-Weg (seit 04.11.2026 wird Echo für Mac notarisiert).
+    # The Developer ID certificate and the notarization key are secrets of the
+    # `release-signing` environment, whose deployment rule admits only `main`.
+    # Workflows on other branches never receive them. verify_macos_platform_trust
+    # rejects every macOS build that is not Developer ID signed and notarized.
     environment: release-signing
     permissions:
       contents: write
@@ -991,7 +991,7 @@ jobs:
 
   verify_macos_platform_trust:
     needs: [prepare, reserve, build]
-    if: needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.requires_platform_trust == 'true'
+    if: needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.requires_macos_trust == 'true'
     runs-on: macos-15
     # GitHub exposes unpublished draft releases only to push-capable tokens.
     # The verifier remains read-only; the workflow contract forbids mutations.
@@ -1017,8 +1017,8 @@ jobs:
           APPLE_SIGNING_AUTHORITY: ${{ vars.APPLE_SIGNING_AUTHORITY }}
         run: |
           set -euo pipefail
-          [ -n "$APPLE_TEAM_ID" ] || { echo "::error::repository variable APPLE_TEAM_ID is required for v1+"; exit 1; }
-          [ -n "$APPLE_SIGNING_AUTHORITY" ] || { echo "::error::repository variable APPLE_SIGNING_AUTHORITY is required for v1+"; exit 1; }
+          [ -n "$APPLE_TEAM_ID" ] || { echo "::error::repository variable APPLE_TEAM_ID is required for macOS releases"; exit 1; }
+          [ -n "$APPLE_SIGNING_AUTHORITY" ] || { echo "::error::repository variable APPLE_SIGNING_AUTHORITY is required for macOS releases"; exit 1; }
           source scripts/release-assets.sh
           release_assets_load "$REPO" "$RELEASE_ID" "$TAG" "$PRERELEASE"
 
@@ -1100,6 +1100,7 @@ jobs:
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
           REQUIRED: ${{ needs.prepare.outputs.requires_platform_trust }}
+          MAC_REQUIRED: ${{ needs.prepare.outputs.requires_macos_trust }}
           UPDATER_RESULT: ${{ needs.verify_updater_trust.result }}
           UPDATER_EVIDENCE: ${{ needs.verify_updater_trust.outputs.evidence }}
           MAC_RESULT: ${{ needs.verify_macos_platform_trust.result }}
@@ -1135,26 +1136,33 @@ jobs:
             || { echo "::error::updater verifier returned malformed or mismatched evidence"; exit 1; }
           echo "updater_evidence=$UPDATER_EVIDENCE" >> "$GITHUB_OUTPUT"
 
+          [ "$MAC_REQUIRED" = true ] \
+            || { echo "::error::release policy returned invalid requires_macos_trust=$MAC_REQUIRED"; exit 1; }
+          [ "$MAC_RESULT" = success ] \
+            || { echo "::error::macOS platform trust result is $MAC_RESULT"; exit 1; }
+          for hash in "$MAC_APP_HASH" "$MAC_DMG_HASH"; do
+            [[ "$hash" =~ ^[0-9a-f]{64}$ ]] \
+              || { echo "::error::macOS platform trust job returned an invalid SHA-256"; exit 1; }
+          done
+          [ "$(jq -r '.mac.sha256' <<<"$UPDATER_EVIDENCE")" = "$MAC_APP_HASH" ] \
+            || { echo "::error::macOS native and updater checks covered different bytes"; exit 1; }
+          printf 'app_archive_sha256=%s\ndmg_sha256=%s\n' "$MAC_APP_HASH" "$MAC_DMG_HASH" >> "$GITHUB_OUTPUT"
+
           case "$REQUIRED" in
             false)
-              echo "0.x release: cryptographic updater gate passed; native platform trust is not required by policy"
+              echo "0.x release: updater and macOS platform trust gates passed; Windows platform trust is not required by policy"
               ;;
             true)
-              [ "$MAC_RESULT" = success ] \
-                || { echo "::error::macOS platform trust result is $MAC_RESULT"; exit 1; }
               [ "$WINDOWS_RESULT" = success ] \
                 || { echo "::error::Windows platform trust result is $WINDOWS_RESULT"; exit 1; }
-              for hash in "$MAC_APP_HASH" "$MAC_DMG_HASH" "$WINDOWS_X64_HASH" "$WINDOWS_ARM64_HASH"; do
+              for hash in "$WINDOWS_X64_HASH" "$WINDOWS_ARM64_HASH"; do
                 [[ "$hash" =~ ^[0-9a-f]{64}$ ]] \
                   || { echo "::error::platform trust job returned an invalid SHA-256"; exit 1; }
               done
-              [ "$(jq -r '.mac.sha256' <<<"$UPDATER_EVIDENCE")" = "$MAC_APP_HASH" ] \
-                || { echo "::error::macOS native and updater checks covered different bytes"; exit 1; }
               [ "$(jq -r '.windows_x64.sha256' <<<"$UPDATER_EVIDENCE")" = "$WINDOWS_X64_HASH" ] \
                 || { echo "::error::Windows x64 native and updater checks covered different bytes"; exit 1; }
               [ "$(jq -r '.windows_arm64.sha256' <<<"$UPDATER_EVIDENCE")" = "$WINDOWS_ARM64_HASH" ] \
                 || { echo "::error::Windows ARM64 native and updater checks covered different bytes"; exit 1; }
-              printf 'app_archive_sha256=%s\ndmg_sha256=%s\n' "$MAC_APP_HASH" "$MAC_DMG_HASH" >> "$GITHUB_OUTPUT"
               printf 'windows_x64_sha256=%s\nwindows_arm64_sha256=%s\n' \
                 "$WINDOWS_X64_HASH" "$WINDOWS_ARM64_HASH" >> "$GITHUB_OUTPUT"
               echo "v1+ updater and native platform trust gates passed"
@@ -1167,11 +1175,12 @@ jobs:
 
   publish:
     # Atomar: Publish erst nach kryptografischer Updater-Prüfung aller vier
-    # Plattformen und — für v1+ — nativer macOS-/Windows-Verifikation. Alle acht
+    # Plattformen, nativer macOS-Verifikation und — für v1+ — nativer
+    # Windows-Verifikation. Alle acht
     # Updater-Dateien werden unmittelbar vor Publish über ID und SHA-256 gebunden.
     needs: [prepare, reserve, build, verify_updater_trust, platform_trust]
-    # `always()` is required here: for 0.x the two native platform-verifier jobs
-    # are intentionally skipped. GitHub otherwise propagates that transitive
+    # `always()` is required here: for 0.x the native Windows verifier job is
+    # intentionally skipped. GitHub otherwise propagates that transitive
     # skip to this job even though the aggregate platform_trust gate succeeded.
     if: always() && needs.prepare.outputs.should_build == 'true' && needs.verify_updater_trust.result == 'success' && needs.platform_trust.result == 'success'
     runs-on: ubuntu-24.04
@@ -1183,6 +1192,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TRUST_REQUIRED: ${{ needs.prepare.outputs.requires_platform_trust }}
+          MAC_TRUST_REQUIRED: ${{ needs.prepare.outputs.requires_macos_trust }}
           UPDATER_EVIDENCE: ${{ needs.verify_updater_trust.outputs.evidence }}
           VERIFIED_MAC_APP_SHA256: ${{ needs.platform_trust.outputs.app_archive_sha256 }}
           VERIFIED_MAC_DMG_SHA256: ${{ needs.platform_trust.outputs.dmg_sha256 }}
@@ -1251,15 +1261,18 @@ jobs:
             verify_hash "$trust_dir/$name.sig" "$expected_sig_hash" "$name.sig"
           done
 
+          [ "$MAC_TRUST_REQUIRED" = true ] \
+            || { echo "::error::invalid macOS trust requirement: $MAC_TRUST_REQUIRED"; exit 1; }
+          release_asset_download "$dmg" "$trust_dir/$dmg"
+          dmg_id="$RELEASE_ASSET_LAST_ID"
+          verify_hash "$trust_dir/$mac" "$VERIFIED_MAC_APP_SHA256" "$mac native trust"
+          verify_hash "$trust_dir/$dmg" "$VERIFIED_MAC_DMG_SHA256" "$dmg"
+
           case "$TRUST_REQUIRED" in
             false)
-              echo "0.x release: updater trust is bound; native platform trust is not required by policy"
+              echo "0.x release: updater and macOS trust are bound; Windows platform trust is not required by policy"
               ;;
             true)
-              release_asset_download "$dmg" "$trust_dir/$dmg"
-              dmg_id="$RELEASE_ASSET_LAST_ID"
-              verify_hash "$trust_dir/$mac" "$VERIFIED_MAC_APP_SHA256" "$mac native trust"
-              verify_hash "$trust_dir/$dmg" "$VERIFIED_MAC_DMG_SHA256" "$dmg"
               verify_hash "$trust_dir/$win64" "$VERIFIED_WINDOWS_X64_SHA256" "$win64 native trust"
               verify_hash "$trust_dir/$winarm" "$VERIFIED_WINDOWS_ARM64_SHA256" "$winarm native trust"
               ;;
@@ -1324,10 +1337,8 @@ jobs:
             [ "$(jq -r --arg name "$name.sig" '.assets[] | select(.name == $name) | .id' <<<"$final")" = "$expected_sig_id" ] \
               || { echo "::error::$name.sig was replaced after hash verification"; exit 1; }
           done
-          if [ "$TRUST_REQUIRED" = true ]; then
-            [ "$(jq -r --arg name "$dmg" '.assets[] | select(.name == $name) | .id' <<<"$final")" = "$dmg_id" ] \
-              || { echo "::error::$dmg was replaced after hash verification"; exit 1; }
-          fi
+          [ "$(jq -r --arg name "$dmg" '.assets[] | select(.name == $name) | .id' <<<"$final")" = "$dmg_id" ] \
+            || { echo "::error::$dmg was replaced after hash verification"; exit 1; }
 
           if [ "$mode" = "draft_stable" ]; then
             python3 scripts/held-stable.py seal \

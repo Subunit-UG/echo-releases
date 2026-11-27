@@ -64,5 +64,9 @@ if [ "$source_major" != "0" ]; then
   requires_platform_trust=true
 fi
 
-printf 'release_mode=%s\nprerelease=%s\nrequires_platform_trust=%s\n' \
-  "$mode" "$prerelease" "$requires_platform_trust"
+# Every macOS release, including 0.x, requires a Developer ID signature with a
+# TeamIdentifier and a stapled notarization ticket.
+requires_macos_trust=true
+
+printf 'release_mode=%s\nprerelease=%s\nrequires_platform_trust=%s\nrequires_macos_trust=%s\n' \
+  "$mode" "$prerelease" "$requires_platform_trust" "$requires_macos_trust"
